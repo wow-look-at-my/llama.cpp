@@ -968,6 +968,27 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Gemma 4 MTP: greedy multi-step draft from the loaded gemma4_assistant, cross-attending
+    // the target's already-stored KV cache for sequence seq_id. Requires a prior
+    // llama_model_load_mtp_from_file() on the model. Returns 0 on success, negative on error.
+    //   attn_pos        : last accepted position; draft step k attends at attn_pos + 1 + k
+    //   last_token      : seed token id for the first draft step
+    //   h_prev          : [n_embd_backbone] seed hidden state (overwritten with each step's h_post)
+    //   n_steps         : number of tokens to draft
+    //   out_drafts      : [n_steps] output drafted token ids
+    //   out_logits      : optional [n_steps * n_vocab] per-step logits, or NULL
+    //   out_h_prev_last : optional [n_embd_backbone] final hidden state, or NULL
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   attn_pos,
+                     llama_token   last_token,
+                           float * h_prev,
+                         int32_t   n_steps,
+                     llama_token * out_drafts,
+                           float * out_logits,
+                           float * out_h_prev_last);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -2304,6 +2305,32 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+llm_graph_params llama_context::graph_params_mtp(
+        llm_graph_result * res,
+        const llama_ubatch & ubatch,
+        const llama_memory_context_i * mctx) const {
+    const llama_model * mtp = model.mtp_assistant.get();
+    GGML_ASSERT(mtp);
+
+    return {
+        /*.arch        =*/ mtp->arch,
+        /*.hparams     =*/ mtp->hparams,
+        /*.cparams     =*/ cparams,
+        /*.ubatch      =*/ ubatch,
+        /*.gtype       =*/ LLM_GRAPH_TYPE_MTP,
+        /*.sched       =*/ sched_mtp.get(),
+        /*.backend_cpu =*/ backend_cpu,
+        /*.cvec        =*/ cvec.get(),
+        /*.loras       =*/ loras.get(),
+        /*.mctx        =*/ mctx,
+        /*.cross       =*/ &cross,
+        /*.samplers    =*/ sampling.samplers,
+        /*.n_outputs   =*/ n_outputs,
+        /*.cb          =*/ graph_get_cb(),
+        /*.res         =*/ res,
+    };
+}
+
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -2357,6 +2384,314 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+//
+// Gemma 4 MTP draft (separate gemma4_assistant cross-attending the target KV)
+//
+
+bool llama_context::ensure_sched_mtp() {
+    if (sched_mtp) {
+        return true;
+    }
+    if (!model.mtp_assistant) {
+        return false;
+    }
+
+    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const size_t   max_nodes = this->graph_max_nodes(n_tokens);
+
+    gf_res_prev_mtp.reset(new llm_graph_result(max_nodes));
+    sched_mtp.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            max_nodes, /*pipeline_parallel*/ false, cparams.op_offload));
+    if (!sched_mtp) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_new failed for sched_mtp\n", __func__);
+        gf_res_prev_mtp.reset();
+        return false;
+    }
+
+    // Reserve a single-token MTP graph so backends allocate compute buffers on sched_mtp.
+    // The MTP graph is invariant in size (always n_tokens=1, n_seqs=1, n_outputs=1),
+    // so a single reserve covers all subsequent decode_mtp calls.
+    {
+        auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+        if (!kv_iswa) {
+            LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory\n", __func__);
+            sched_mtp.reset();
+            gf_res_prev_mtp.reset();
+            return false;
+        }
+
+        llama_memory_context_ptr mctx = memory->init_full();
+        if (!mctx) {
+            LLAMA_LOG_ERROR("%s: failed to init memory context for MTP reserve\n", __func__);
+            sched_mtp.reset();
+            gf_res_prev_mtp.reset();
+            return false;
+        }
+
+        const uint32_t n_bb = model.mtp_assistant->hparams.n_embd_backbone;
+        auto data = std::make_shared<llama_ubatch::data_t>();
+        data->token.resize(1);
+        data->embd.resize(n_bb);
+        data->pos.resize(1);
+        data->n_seq_id.resize(1);
+        data->seq_id.resize(1);
+        data->seq_id_data.resize(1);
+        data->output.resize(1);
+        data->seq_idx.resize(LLAMA_MAX_SEQ, -1);
+        data->seq_id_unq.push_back(0);
+        data->seq_idx[0] = 0;
+        data->n_seq_id[0] = 1;
+        data->seq_id_data[0] = 0;
+        data->seq_id[0] = &data->seq_id_data[0];
+        data->output[0] = 1;
+
+        llama_ubatch ub{};
+        ub.b_equal_seqs = 1;
+        ub.n_tokens     = 1;
+        ub.n_seq_tokens = 1;
+        ub.n_seqs       = 1;
+        ub.n_seqs_unq   = 1;
+        ub.n_pos        = 1;
+        ub.token        = data->token.data();
+        ub.embd         = data->embd.data();
+        ub.pos          = data->pos.data();
+        ub.n_seq_id     = data->n_seq_id.data();
+        ub.seq_id       = data->seq_id.data();
+        ub.seq_id_unq   = data->seq_id_unq.data();
+        ub.seq_idx      = data->seq_idx.data();
+        ub.output       = data->output.data();
+        ub.data         = data;
+
+        const uint32_t save_n_outputs = n_outputs;
+        n_outputs = 1;
+
+        auto * res = gf_res_prev_mtp.get();
+        const auto gparams = graph_params_mtp(res, ub, mctx.get());
+        res->reset();
+        ggml_backend_sched_reset(sched_mtp.get());
+
+        auto * gf = model.build_graph(gparams);
+        n_outputs = save_n_outputs;
+
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to build MTP reserve graph\n", __func__);
+            sched_mtp.reset();
+            gf_res_prev_mtp.reset();
+            return false;
+        }
+        if (!ggml_backend_sched_reserve(sched_mtp.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to reserve compute buffers on sched_mtp\n", __func__);
+            sched_mtp.reset();
+            gf_res_prev_mtp.reset();
+            return false;
+        }
+        // Discard the reserve graph cache so the first real call rebuilds with proper inputs.
+        res->reset();
+        ggml_backend_sched_reset(sched_mtp.get());
+    }
+
+    return true;
+}
+
+llm_graph_result * llama_context::process_ubatch_mtp(
+        const llama_ubatch & ubatch,
+        llama_memory_context_i * mctx,
+        ggml_status & ret) {
+    GGML_ASSERT(sched_mtp && gf_res_prev_mtp);
+
+    auto * res = gf_res_prev_mtp.get();
+    auto * gf  = res->get_gf();
+
+    // The MTP graph always outputs a single logits row + h_post, so n_outputs=1 is the
+    // only valid value; set it explicitly in case a prior target decode mutated it.
+    llm_graph_params gparams = graph_params_mtp(res, ubatch, mctx);
+    gparams.n_outputs = 1;
+    gparams.sched     = sched_mtp.get();
+
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+        // sched_mtp uses no pipeline parallelism, so no pre-input synchronize is needed.
+    } else {
+        res->reset();
+
+        ggml_backend_sched_reset(sched_mtp.get());
+        ggml_backend_sched_set_eval_callback(sched_mtp.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+        gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to initialize MTP graph\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (!ggml_backend_sched_alloc_graph(sched_mtp.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+    }
+
+    res->set_inputs(&ubatch);
+
+    const auto status = graph_compute_mtp(res->get_gf());
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: failed to compute MTP graph, compute status: %d\n", __func__, status);
+        ret = status;
+        return nullptr;
+    }
+
+    ret = GGML_STATUS_SUCCESS;
+    return res;
+}
+
+ggml_status llama_context::graph_compute_mtp(ggml_cgraph * gf) {
+    // MTP graphs are always single-token; mirror graph_compute()'s threadpool/n_threads
+    // setup for the CPU backend so the MTP head runs on the same configuration.
+    const int n_threads = cparams.n_threads;
+    ggml_threadpool_t tp = threadpool;
+
+    if (backend_cpu != nullptr) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, tp);
+        }
+    }
+    for (const auto & set_n_threads_fn : set_n_threads_fns) {
+        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    auto status = ggml_backend_sched_graph_compute_async(sched_mtp.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async (MTP) failed with %d\n",
+                __func__, status);
+    }
+    return status;
+}
+
+int32_t llama_context::decode_mtp(
+        llama_seq_id  seq_id,
+        llama_pos     attn_pos,
+        llama_token   last_token,
+        float       * h_prev,
+        int32_t       n_steps,
+        llama_token * out_drafts,
+        float       * out_logits,
+        float       * out_h_prev_last) {
+    if (!model.mtp_assistant) {
+        LLAMA_LOG_ERROR("%s: no MTP assistant loaded (use llama_model_load_mtp_from_file)\n", __func__);
+        return -1;
+    }
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: context has no KV memory\n", __func__);
+        return -2;
+    }
+    auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get());
+    if (!kv_iswa) {
+        LLAMA_LOG_ERROR("%s: MTP requires llama_kv_cache_iswa memory (Gemma 4 target)\n", __func__);
+        return -3;
+    }
+
+    if (!ensure_sched_mtp()) {
+        LLAMA_LOG_ERROR("%s: failed to initialize MTP scheduler\n", __func__);
+        return -8;
+    }
+
+    const int32_t  n_vocab = model.vocab.n_tokens();
+    const uint32_t n_bb    = model.mtp_assistant->hparams.n_embd_backbone;
+    if (n_bb == 0) {
+        LLAMA_LOG_ERROR("%s: assistant missing n_embd_backbone metadata\n", __func__);
+        return -4;
+    }
+
+    if (n_steps <= 0) {
+        return 0;
+    }
+
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(1);
+    data->embd.resize(n_bb);
+    data->pos.resize(1);
+    data->n_seq_id.resize(1);
+    data->seq_id.resize(1);
+    data->seq_id_data.resize(1);
+    data->output.resize(1);
+    data->seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    data->seq_id_unq.push_back(seq_id);
+    data->seq_idx[(size_t) seq_id] = 0;
+
+    llama_ubatch ub{};
+    ub.b_equal_seqs = 1;
+    ub.n_tokens     = 1;
+    ub.n_seq_tokens = 1;
+    ub.n_seqs       = 1;
+    ub.n_seqs_unq   = 1;
+    ub.n_pos        = 1;
+    ub.token        = data->token.data();
+    ub.embd         = data->embd.data();
+    ub.pos          = data->pos.data();
+    ub.n_seq_id     = data->n_seq_id.data();
+    ub.seq_id       = data->seq_id.data();
+    ub.seq_id_unq   = data->seq_id_unq.data();
+    ub.seq_idx      = data->seq_idx.data();
+    ub.output       = data->output.data();
+    ub.data         = data;
+
+    data->n_seq_id[0]    = 1;
+    data->seq_id_data[0] = seq_id;
+    data->seq_id[0]      = &data->seq_id_data[0];
+    data->output[0]      = 0;
+
+    // Sequential MTP draft on the dedicated sched_mtp: per step run a fresh single-token
+    // graph; each step's argmax feeds the next step's last_token; h_post -> next h_prev.
+    for (int32_t k = 0; k < n_steps; ++k) {
+        data->token[0] = last_token;
+        data->pos[0]   = attn_pos + 1 + (llama_pos) k;
+        std::memcpy(data->embd.data(), h_prev, n_bb * sizeof(float));
+
+        llama_memory_context_ptr mctx = kv_iswa->init_mtp(seq_id, ub);
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: init_mtp failed at step %d\n", __func__, k);
+            return -5;
+        }
+
+        ggml_status status = GGML_STATUS_SUCCESS;
+        llm_graph_result * res = process_ubatch_mtp(ub, mctx.get(), status);
+        if (!res || status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: MTP graph failed at step %d (status %d)\n", __func__, k, (int) status);
+            return -6;
+        }
+
+        ggml_backend_sched_synchronize(sched_mtp.get());
+
+        ggml_tensor * t_arg = res->get_argmax();
+        GGML_ASSERT(t_arg && "MTP graph must publish in-graph argmax tensor");
+
+        int32_t best_i32 = 0;
+        ggml_backend_tensor_get(t_arg, &best_i32, 0, sizeof(int32_t));
+        out_drafts[k] = (llama_token) best_i32;
+
+        if (out_logits) {
+            ggml_tensor * t_logits = res->get_logits();
+            GGML_ASSERT(t_logits);
+            ggml_backend_tensor_get(t_logits, out_logits + (int64_t) k * n_vocab,
+                    0, (size_t) n_vocab * sizeof(float));
+        }
+
+        ggml_tensor * t_post = res->get_embd();
+        GGML_ASSERT(t_post);
+        ggml_backend_tensor_get(t_post, h_prev, 0, n_bb * sizeof(float));
+
+        last_token = (llama_token) best_i32;
+    }
+
+    if (out_h_prev_last) {
+        std::memcpy(out_h_prev_last, h_prev, n_bb * sizeof(float));
+    }
+
+    return 0;
 }
 
 //
@@ -3931,6 +4266,24 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_mtp(
+        llama_context * ctx,
+        llama_seq_id    seq_id,
+        llama_pos       attn_pos,
+        llama_token     last_token,
+        float         * h_prev,
+        int32_t         n_steps,
+        llama_token   * out_drafts,
+        float         * out_logits,
+        float         * out_h_prev_last) {
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: ctx is NULL\n", __func__);
+        return -1;
+    }
+    return ctx->decode_mtp(seq_id, attn_pos, last_token, h_prev, n_steps,
+                           out_drafts, out_logits, out_h_prev_last);
 }
 
 //
