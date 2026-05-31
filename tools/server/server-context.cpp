@@ -794,12 +794,20 @@ private:
             }
         }
 
+        // Gemma 4 MTP: the gemma4_assistant is loaded INTO the target model (single context,
+        // cross-attends the target KV). Unlike a draft model / Qwen NextN, it has no separate
+        // model or ctx_dft, so the draft-model load + MTP-context creation below are skipped.
+        const bool is_gemma4_mtp = std::find(params_base.speculative.types.begin(),
+                                             params_base.speculative.types.end(),
+                                             COMMON_SPECULATIVE_TYPE_GEMMA4_MTP) != params_base.speculative.types.end();
+
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                             params_base.speculative.types.end(),
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            const bool has_draft = params_base.speculative.has_dft();
+            // gemma4-mtp has no separate draft model/context; its assistant memory is part of the target load
+            const bool has_draft = params_base.speculative.has_dft() && !is_gemma4_mtp;
 
             if (has_draft || spec_mtp) {
                 common_params params_dft = params_base;
@@ -888,7 +896,14 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (params_base.speculative.has_dft()) {
+        if (is_gemma4_mtp) {
+            // gemma4_assistant was already loaded into model_tgt by common_init_from_params().
+            // It cross-attends the target's KV (read-only) and has no context/KV of its own,
+            // so there is no model_dft / ctx_dft. The driver runs on ctx_tgt via llama_decode_mtp().
+            SRV_INF("%s", "gemma4-mtp: assistant loaded into target model; driving on the single context\n");
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = nullptr;
+        } else if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
 
