@@ -806,6 +806,26 @@ struct llama_model_gemma4 : public llama_model_base {
         ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
     };
 
+    // Gemma 4 MTP draft head (built when params.gtype == LLM_GRAPH_TYPE_MTP). Unlike Qwen's
+    // in-model NextN, the gemma4 assistant is a SEPARATE model that cross-attends the target's
+    // stored KV. The target (this model) supplies tok_embd + KV; `mtp` supplies assistant weights.
+    struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & target, const llama_model & mtp, const llm_graph_params & params);
+
+        const llama_model & target;
+        const llama_model & mtp;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+// gemma4_assistant: the MTP draft model. Loaded as a nested model on the target via
+// llama_model_load_mtp_from_file(); never used as a primary (-m) model.
+struct llama_model_gemma4_assistant : public llama_model_base {
+    llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 

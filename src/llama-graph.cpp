@@ -135,6 +135,24 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch && ubatch->n_tokens == 1);
+    GGML_ASSERT(ubatch->token && ubatch->embd);
+    GGML_ASSERT(inp_last_token && inp_h_prev);
+
+    ggml_backend_tensor_set(inp_last_token, ubatch->token, 0, sizeof(llama_token));
+
+    const int64_t n_bb = inp_h_prev->ne[0];
+    ggml_backend_tensor_set(inp_h_prev, ubatch->embd, 0, n_bb * sizeof(float));
+}
+
+bool llm_graph_input_mtp::can_reuse(const llm_graph_params & params) {
+    if (params.gtype != LLM_GRAPH_TYPE_MTP) {
+        return false;
+    }
+    return inp_last_token && inp_last_token->ne[0] == 1 && inp_h_prev && inp_h_prev->ne[1] == 1;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2467,6 +2485,57 @@ ggml_tensor * llm_graph_context::build_attn(
         //cb(cur, "kqv_wo", il);
     }
 
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+// Gemma 4 MTP cross-attention. Query comes from the assistant model; K/V are read
+// (read-only) from the TARGET model's already-populated KV cache at layer il_kv_tgt
+// (the last target layer of the matching attention type — full or sliding).
+//
+// TurboQuant note: atomic applies a WHT rotation here when the target KV tensor is a
+// TURBO{2,3,4}_0 type (q-padding + ggml_turbo_wht on the query, V-head unpadding after
+// MHA). That path is PHASE 2 (task #12). With normal f16/q8_0 KV it degrades to plain
+// build_attn_mha, which is exactly what we want for the turbo-free MTP bring-up.
+ggml_tensor * llm_graph_context::build_attn_mtp(
+        llm_graph_input_attn_kv_iswa * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * q_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            float     kq_scale,
+            int       il_mtp,
+        int32_t     il_kv_tgt,
+            bool     read_from_swa_kv,
+        int64_t     kv_embd_head_v,
+        int64_t     kv_n_head_v,
+            bool     use_k_as_v) const {
+    GGML_UNUSED(kv_embd_head_v);
+    GGML_UNUSED(kv_n_head_v);
+
+    ggml_build_forward_expand(gf, q_cur);
+
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur  = read_from_swa_kv ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+
+    const auto & kq_mask = read_from_swa_kv ? inp->get_kq_mask_swa() : inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il_kv_tgt);
+    ggml_tensor * v = use_k_as_v ? k : mctx_cur->get_v(ctx0, il_kv_tgt);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il_mtp);
+    cb(cur, "kqv_out_mtp", il_mtp);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
+        cb(cur, "mtp_wo_out", il_mtp);
+    }
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
