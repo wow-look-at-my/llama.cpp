@@ -880,6 +880,16 @@ private:
             }
         }
 
+        // Ollama compat: publish llama.cpp's model-load progress (0..1) so the
+        // /health endpoint can report a real fraction while the model loads into
+        // memory. common_init_from_params() forwards this to the model loader,
+        // which calls it with size_done/size_data as tensors are read.
+        server_load_progress().store(0.0f);
+        params_base.load_progress_callback = [](float progress, void * /*user_data*/) -> bool {
+            server_load_progress().store(progress);
+            return true; // continue loading
+        };
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();

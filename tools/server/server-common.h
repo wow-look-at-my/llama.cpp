@@ -12,8 +12,19 @@
 #include <string>
 #include <vector>
 #include <cinttypes>
+#include <atomic>
 
 using json = nlohmann::ordered_json;
+
+// Ollama compat: model-load progress in [0,1], published by the model-loader
+// progress callback during server_context::load_model() and read by the /health
+// middleware (server-http.cpp) so the Ollama scheduler can surface a real
+// load-progress fraction while a cold model loads into memory. A function-local
+// static keeps a single shared instance header-only across translation units.
+inline std::atomic<float> & server_load_progress() {
+    static std::atomic<float> progress{0.0f};
+    return progress;
+}
 
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
