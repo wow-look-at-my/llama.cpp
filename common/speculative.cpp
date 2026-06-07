@@ -29,7 +29,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"gemma4-mtp",    COMMON_SPECULATIVE_TYPE_GEMMA4_MTP}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -777,6 +778,192 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// Gemma 4 MTP. Unlike draft-mtp (Qwen NextN, which runs a SECOND context/model that
+// self-attends its own KV), the gemma4_assistant is loaded INTO the target model and
+// cross-attends the target's already-stored KV cache (read-only). There is no ctx_dft:
+// drafting is driven by llama_decode_mtp() on ctx_tgt. We snapshot the target's post-norm
+// hidden state per verified row in process(), pick the row aligned with the last accepted
+// token in accept(), and seed llama_decode_mtp() with it in draft().
+struct common_speculative_impl_gemma4_mtp : public common_speculative_impl {
+    common_params_speculative_draft params; // reuses the draft params slot (ctx_tgt)
+
+    llama_context * ctx_tgt = nullptr;
+
+    int32_t n_max = 0;  // max tokens to draft per call
+    int32_t n_bb  = 0;  // MTP backbone hidden size (h_prev dim)
+    int32_t n_out = 0;  // target post-norm embedding size
+
+    // Per-sequence seed hidden state (post-norm h of the last accepted token).
+    std::vector<std::vector<float>> pending_h;   // [n_seq][n_bb]
+
+    // Hidden rows from the most recent target verification batch, grouped by seq.
+    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+    std::vector<std::vector<float>> verify_h;    // [n_seq][n_rows*n_bb]
+    std::vector<int32_t> verify_h_rows;
+
+    std::vector<int32_t> i_batch_beg;
+    std::vector<int32_t> i_batch_end;
+
+    // scratch draft output for one draft() call
+    std::vector<llama_token> drafts;
+
+    common_speculative_impl_gemma4_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_GEMMA4_MTP, n_seq)
+        , params(params.draft)
+    {
+        ctx_tgt = this->params.ctx_tgt;
+        GGML_ASSERT(ctx_tgt && "gemma4-mtp requires ctx_tgt to be set (the target context)");
+        GGML_ASSERT(this->params.ctx_dft == nullptr && "gemma4-mtp uses a single context; ctx_dft must be null");
+
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+        n_max = this->params.n_max;
+        n_bb  = (int32_t) llama_model_mtp_n_embd_backbone(model_tgt);
+        n_out = llama_model_n_embd_out(model_tgt);
+
+        LOG_INF("%s: adding speculative implementation 'gemma4-mtp'\n", __func__);
+        LOG_INF("%s: - n_max=%d, n_embd_backbone=%d, n_embd_out=%d\n", __func__, n_max, n_bb, n_out);
+
+        if (n_bb <= 0) {
+            LOG_ERR("%s: target model has no gemma4 MTP assistant loaded "
+                    "(use --mtp-head <assistant.gguf>)\n", __func__);
+            throw std::runtime_error("gemma4-mtp requires an MTP assistant loaded into the target model");
+        }
+
+        // MTP reads the target's post-norm hidden state; keep embeddings on across decodes.
+        llama_set_embeddings(ctx_tgt, true);
+
+        pending_h.assign(n_seq, std::vector<float>(n_bb, 0.0f));
+        verify_h.assign(n_seq, {});
+        verify_h_rows.assign(n_seq, 0);
+        i_batch_beg.assign(n_seq, -1);
+        i_batch_end.assign(n_seq, -1);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        llama_set_embeddings(ctx_tgt, true);
+    }
+
+    // After each target decode, snapshot post-norm hidden rows for each sequence so accept()
+    // can pick the row aligned with the last accepted token.
+    bool process(const llama_batch & batch_in) override {
+        if (batch_in.n_tokens <= 0 || batch_in.token == nullptr) {
+            return true;
+        }
+
+        const int32_t n_tokens = batch_in.n_tokens;
+
+        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+
+        // assumes each sequence's tokens are contiguous within the batch (same contract as draft-mtp)
+        for (int k = 0; k < n_tokens; ++k) {
+            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+            const llama_seq_id seq_id = batch_in.seq_id[k][0];
+            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                continue;
+            }
+            i_batch_end[seq_id] = k;
+            if (i_batch_beg[seq_id] < 0) {
+                i_batch_beg[seq_id] = k;
+            }
+        }
+
+        const int32_t n_copy = std::min(n_bb, n_out);
+        const size_t row_bytes = (size_t) n_bb * sizeof(float);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_end[seq_id] < 0) {
+                continue;
+            }
+
+            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            verify_h_rows[seq_id] = n_rows;
+            verify_h[seq_id].assign((size_t) n_rows * n_bb, 0.0f);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                // only output rows have embeddings; non-output rows (e.g. interior prefill) stay zero
+                const float * h = llama_get_embeddings_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                if (h == nullptr) {
+                    continue;
+                }
+                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_bb, h, (size_t) n_copy * sizeof(float));
+            }
+
+            // default seed = last row (correct for prefill / full-accept; refined by accept())
+            std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_bb, row_bytes);
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        const llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            int32_t n_steps = n_max;
+            if (dp.n_max > 0) {
+                n_steps = std::min(n_steps, dp.n_max);
+            }
+            if (n_steps <= 0) {
+                continue;
+            }
+
+            llama_pos attn_pos = mem ? llama_memory_seq_pos_max(mem, seq_id) : (llama_pos) 0;
+            if (attn_pos < 0) {
+                attn_pos = 0;
+            }
+
+            drafts.assign((size_t) n_steps, 0);
+
+            const int32_t rc = llama_decode_mtp(
+                    ctx_tgt,
+                    seq_id,
+                    attn_pos,
+                    dp.id_last,
+                    pending_h[seq_id].data(),
+                    n_steps,
+                    drafts.data(),
+                    /* out_logits      */ nullptr,
+                    /* out_h_prev_last */ nullptr);
+
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode_mtp failed (seq_id=%d, rc=%d)\n", __func__, (int) seq_id, (int) rc);
+                continue;
+            }
+
+            auto & result = *dp.result;
+            result.assign(drafts.begin(), drafts.end());
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t n_rows = verify_h_rows[seq_id];
+        if (n_rows <= 0) {
+            return;
+        }
+
+        // Row 0 = sampled token, row k = k-th accepted draft. Seed the next draft from the
+        // hidden state of the last accepted token.
+        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_bb * sizeof(float);
+        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_bb, row_bytes);
+    }
+
+    bool need_embd() const override {
+        return true;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -1278,6 +1465,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_GEMMA4_MTP:    return "gemma4-mtp";
         default:                                    return "unknown";
     }
 }
@@ -1330,6 +1518,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        // Gemma 4 MTP: single context (assistant loaded into the target); needs ctx_tgt, NOT ctx_dft.
+        bool has_gemma4_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_GEMMA4_MTP)) && params.draft.ctx_tgt != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1338,7 +1528,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -1364,7 +1554,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 LOG_WRN("%s: draft model is not specified - cannot use 'draft' type\n", __func__);
                 has_draft_simple = false;
             }
-        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3) {
+        } else if (has_draft_model_path && !has_mtp && !has_gemma4_mtp && !has_draft_eagle3) {
             LOG_WRN("%s: draft model is specified but 'draft' speculative type is not explicitly enabled - enabling it\n", __func__);
             has_draft_simple = true;
         }
@@ -1377,6 +1567,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+        }
+        if (has_gemma4_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_GEMMA4_MTP, params));
         }
     }
 
@@ -1396,6 +1589,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_GEMMA4_MTP: {
+                impls.push_back(std::make_unique<common_speculative_impl_gemma4_mtp>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

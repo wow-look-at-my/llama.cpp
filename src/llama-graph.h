@@ -34,6 +34,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_MTP,        // gemma4_assistant: separate-model cross-attn draft head (one step)
 };
 
 enum llm_ffn_op_type {
@@ -137,6 +138,19 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// Gemma 4 MTP: last target token id + backbone hidden (n_bb floats) for a single step.
+class llm_graph_input_mtp : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp() = default;
+    ~llm_graph_input_mtp() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * inp_last_token = nullptr; // I32 [1]
+    ggml_tensor * inp_h_prev     = nullptr; // F32 [n_bb, 1]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -703,6 +717,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+    ggml_tensor * get_argmax()      const { return t_argmax; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -732,6 +747,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_argmax      = nullptr; // optional, currently MTP-only (see get_argmax): I32 [1] on-device greedy token
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -1045,6 +1061,25 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+
+    // Gemma 4 MTP cross-attention: query from the assistant, but K/V read from the TARGET's
+    // already-stored KV cache at layer il_kv_tgt (last layer of the matching attention type).
+    // Read-only on the target cache; writes nothing. (TurboQuant rotation paths are phase 2.)
+    ggml_tensor * build_attn_mtp(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * q_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il_mtp,
+              int32_t   il_kv_tgt,
+                   bool   read_from_swa_kv,
+                int64_t   kv_embd_head_v,
+                int64_t   kv_n_head_v,
+                   bool   use_k_as_v) const;
 
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 
