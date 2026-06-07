@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       model_url:
-        description: "Direct URL to a single-file GGUF to bench"
-        default: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+        description: "Space-separated URL(s) to single-file GGUF(s) to bench (each benched on both arms)"
+        default: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q8_0.gguf"
       llama_ref:
         description: "llama.cpp ref to build (blank = the ref that triggered this)"
         default: ""
@@ -43,7 +43,7 @@ jobs:
   bench:
     runs-on: [self-hosted, gpu, nvidia]
     env:
-      MODEL_URL: ${{ inputs.model_url || 'https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf' }}
+      MODEL_URLS: ${{ inputs.model_url || 'https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q8_0.gguf' }}
       CUDA_ARCH: "86-real"
       PROMPT_SIZES: ${{ inputs.prompt_sizes || '512,2048' }}
       GEN: ${{ inputs.gen_tokens || '128' }}
@@ -82,15 +82,18 @@ jobs:
           "$CUDA_HOME/bin/nvcc" --version | tail -2
           nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-      - name: Fetch model
+      - name: Fetch model(s)
         run: |
           set -euxo pipefail
           mkdir -p models
-          out="models/bench.gguf"
-          curl -fL --retry 4 --retry-delay 3 -o "$out" "$MODEL_URL"
-          test -s "$out" || { echo "::error::model download failed: $MODEL_URL"; exit 1; }
-          ls -lh "$out"
-          echo "MODEL=$PWD/$out" >> "$GITHUB_ENV"
+          i=0
+          for u in $MODEL_URLS; do
+            i=$((i+1))
+            out="models/bench-$i.gguf"
+            curl -fL --retry 4 --retry-delay 3 -o "$out" "$u"
+            test -s "$out" || { echo "::error::model download failed: $u"; exit 1; }
+            ls -lh "$out"
+          done
 
       - name: Build llama-bench x2 (MMQ baseline + GGML_CUDA_FORCE_CUBLAS)
         run: |
@@ -114,17 +117,21 @@ jobs:
       - name: Benchmark
         run: |
           set -uxo pipefail
-          common=(-m "$MODEL" -ngl "$NGL" -p "$PROMPT_SIZES" -n "$GEN" -fa "$FA" -r 3 -o md)
+          common=(-ngl "$NGL" -p "$PROMPT_SIZES" -n "$GEN" -fa "$FA" -r 3 -o md)
           {
             echo "## MMQ vs cuBLAS - sm_86 (\`$CUDA_ARCH\`, CUDA 12.9)"
             echo '```'
             nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
             echo '```'
-            echo "Model: \`$(basename "$MODEL")\`  -p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`  (pp = prefill, the decision-relevant rows)"
-            echo
-            echo "### Baseline (MMQ - what ships today)"
-            ./build-mmq/bin/llama-bench "${common[@]}"
-            echo
-            echo "### GGML_CUDA_FORCE_CUBLAS=ON (mmq instances unused at runtime)"
-            ./build-cublas/bin/llama-bench "${common[@]}"
+            echo "-p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`  (pp = prefill, the decision-relevant rows; the model column shows the quant)"
+            # one binary built per arm; bench every downloaded model on both arms
+            for m in models/*.gguf; do
+              echo
+              echo "### Model: \`$(basename "$m")\`"
+              echo "#### Baseline (MMQ - what ships today)"
+              ./build-mmq/bin/llama-bench -m "$m" "${common[@]}"
+              echo
+              echo "#### GGML_CUDA_FORCE_CUBLAS=ON (mmq instances unused at runtime)"
+              ./build-cublas/bin/llama-bench -m "$m" "${common[@]}"
+            done
           } | tee -a "$GITHUB_STEP_SUMMARY"
