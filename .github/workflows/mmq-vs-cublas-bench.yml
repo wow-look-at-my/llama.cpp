@@ -1,0 +1,104 @@
+# Manual A/B benchmark: MMQ (quantized int8 kernels) vs cuBLAS-dequant, on the
+# self-hosted A6000 (sm_86). Settles whether the 21 mmq template instances earn
+# their compile time, or whether forcing cuBLAS is a net win for our shapes.
+#
+# It is workflow_dispatch ONLY: it never auto-runs on the GPU box. You trigger it,
+# supply the model path + CUDA image, and it builds llama-bench TWICE
+# (baseline=MMQ, and -DGGML_CUDA_FORCE_CUBLAS=ON) then benches both, posting a
+# side-by-side markdown table to the run summary.
+#
+# Note: GGML_CUDA_FORCE_CUBLAS only flips the runtime dispatch (ggml_cuda_should_use_mmq
+# hard-returns false); both builds still COMPILE the mmq instances. So this measures
+# the runtime question. The compile win (dropping the 21 instances) is only worth
+# taking IF cuBLAS ties-or-wins here.
+name: mmq-vs-cublas-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_dir:
+        description: "Host directory containing the .gguf (mounted read-only into the build container)"
+        required: true
+      model_file:
+        description: "Filename of the .gguf inside model_dir (e.g. gemma4-q4_K_M.gguf)"
+        required: true
+      cuda_image:
+        description: "CUDA devel image to build in — must match your driver. Override if 13.x is too new."
+        required: false
+        default: "nvidia/cuda:13.0.1-devel-ubuntu24.04"
+      cuda_arch:
+        description: "CUDA arch (A6000 = 86-real)"
+        required: false
+        default: "86-real"
+      prompt_sizes:
+        description: "llama-bench -p (prefill batch sizes). Set to your real prompt profile."
+        required: false
+        default: "512,2048"
+      gen_tokens:
+        description: "llama-bench -n (decode tokens)"
+        required: false
+        default: "128"
+      ngl:
+        description: "GPU layers to offload (99 = all)"
+        required: false
+        default: "99"
+      flash_attn:
+        description: "Flash attention (1 to match the MTP serving config)"
+        required: false
+        default: "1"
+
+concurrency:
+  group: mmq-bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: [self-hosted, gpu, nvidia]
+    container:
+      image: ${{ inputs.cuda_image }}
+      options: --gpus all
+      volumes:
+        - ${{ inputs.model_dir }}:/models:ro
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates build-essential
+          nvidia-smi || { echo "::error::no GPU visible in container — check --gpus all / driver"; exit 1; }
+          test -f "/models/${{ inputs.model_file }}" || { echo "::error::/models/${{ inputs.model_file }} not found — check model_dir/model_file"; exit 1; }
+
+      - name: Build (MMQ baseline + FORCE_CUBLAS)
+        run: |
+          set -euxo pipefail
+          for v in mmq cublas; do
+            extra=""
+            [ "$v" = cublas ] && extra="-DGGML_CUDA_FORCE_CUBLAS=ON"
+            cmake -S . -B "build-$v" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_CUDA=ON \
+              -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.cuda_arch }}" \
+              $extra
+            cmake --build "build-$v" --target llama-bench
+          done
+          # prove the define actually took for the cublas build
+          grep -q 'GGML_CUDA_FORCE_CUBLAS:BOOL=ON' build-cublas/CMakeCache.txt \
+            || { echo "::error::FORCE_CUBLAS define did not stick"; exit 1; }
+
+      - name: Benchmark both
+        run: |
+          set -uxo pipefail
+          M="/models/${{ inputs.model_file }}"
+          common="-m $M -ngl ${{ inputs.ngl }} -p ${{ inputs.prompt_sizes }} -n ${{ inputs.gen_tokens }} -fa ${{ inputs.flash_attn }} -r 3 -o md"
+          {
+            echo "## MMQ vs cuBLAS — sm_86 (\`${{ inputs.cuda_arch }}\`)"
+            echo '```'; nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; echo '```'
+            echo "Model: \`${{ inputs.model_file }}\`  •  prompt sizes: \`${{ inputs.prompt_sizes }}\`  •  gen: \`${{ inputs.gen_tokens }}\`  •  fa: \`${{ inputs.flash_attn }}\`"
+            echo
+            echo "### Baseline (MMQ — what ships today)"
+            ./build-mmq/bin/llama-bench $common
+            echo
+            echo "### GGML_CUDA_FORCE_CUBLAS=ON (mmq instances unused)"
+            ./build-cublas/bin/llama-bench $common
+          } | tee -a "$GITHUB_STEP_SUMMARY"
