@@ -1,0 +1,32 @@
+name: No scheduled workflows
+
+# Policy guard: scheduled (cron) workflow triggers are banned in this repo.
+#
+# A daily multi-arch Docker build was leaving its linux/s390x leg queued for
+# ~24h on GitHub's shared runners (there is no IBM Z host here), repeating every
+# day for no benefit, so every `schedule:` trigger was removed. This job fails
+# CI if any workflow reintroduces a scheduled trigger. Commented-out lines are
+# ignored, so a schedule that is documented-but-disabled in place is fine.
+#
+# Need a periodic run? Trigger it manually via `workflow_dispatch` instead.
+
+on:
+  push:
+
+jobs:
+  no-scheduled-triggers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject scheduled (cron) workflow triggers
+        run: |
+          set -euo pipefail
+          if grep -rnE '^[[:space:]]*(schedule:|-[[:space:]]*cron:)' \
+              --include='*.yml' --include='*.yaml' .github/workflows/; then
+            echo
+            echo "ERROR: scheduled (cron) workflow triggers are not allowed in this repository."
+            echo "Remove the 'schedule:'/'cron:' lines listed above."
+            echo "Use 'workflow_dispatch:' for manual runs, or 'push:' for CI."
+            exit 1
+          fi
+          echo "OK: no scheduled (cron) triggers found in .github/workflows/."

@@ -2,8 +2,9 @@ name: Update Winget Package
 
 on:
   workflow_dispatch: # allows manual triggering
-  schedule:
-    - cron: '28 5 * * *' # Update every day at 5:28 UTC
+  # Daily schedule disabled.
+  # schedule:
+  #   - cron: '28 5 * * *' # Update every day at 5:28 UTC
 
 jobs:
   update:
