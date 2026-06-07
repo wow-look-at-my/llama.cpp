@@ -75,9 +75,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/tinyllamas
-          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          key: ggml-ci-models-v2-${{ hashFiles('tests/CMakeLists.txt') }}
           restore-keys: |
-            ggml-ci-models-
+            ggml-ci-models-v2-
+          # the model is fetched once on Linux (fetch-models) and restored on
+          # both Linux and Windows build legs, so the cache must be cross-OS
+          enableCrossOsArchive: true
 
       - name: Download test models
         env:
@@ -149,9 +152,12 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: build/tinyllamas
-          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          key: ggml-ci-models-v2-${{ hashFiles('tests/CMakeLists.txt') }}
           restore-keys: |
-            ggml-ci-models-
+            ggml-ci-models-v2-
+          # the model is fetched once on Linux (fetch-models) and restored on
+          # both Linux and Windows build legs, so the cache must be cross-OS
+          enableCrossOsArchive: true
 
       - name: Test
         id: cmake_test
@@ -261,9 +267,12 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: build/tinyllamas
-          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          key: ggml-ci-models-v2-${{ hashFiles('tests/CMakeLists.txt') }}
           restore-keys: |
-            ggml-ci-models-
+            ggml-ci-models-v2-
+          # the model is fetched once on Linux (fetch-models) and restored on
+          # both Linux and Windows build legs, so the cache must be cross-OS
+          enableCrossOsArchive: true
 
       - name: Test
         id: cmake_test
