@@ -85,11 +85,13 @@ jobs:
       - name: Fetch model(s)
         run: |
           set -euxo pipefail
-          mkdir -p models
+          # dedicated dir -- the repo's own models/ ships ggml-vocab-*.gguf test
+          # files that would otherwise be caught by the bench glob and fail to load
+          rm -rf benchmodels && mkdir -p benchmodels
           i=0
           for u in $MODEL_URLS; do
             i=$((i+1))
-            out="models/bench-$i.gguf"
+            out="benchmodels/bench-$i.gguf"
             curl -fL --retry 4 --retry-delay 3 -o "$out" "$u"
             test -s "$out" || { echo "::error::model download failed: $u"; exit 1; }
             ls -lh "$out"
@@ -125,7 +127,7 @@ jobs:
             echo '```'
             echo "-p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`  (pp = prefill, the decision-relevant rows; the model column shows the quant)"
             # one binary built per arm; bench every downloaded model on both arms
-            for m in models/*.gguf; do
+            for m in benchmodels/*.gguf; do
               echo
               echo "### Model: \`$(basename "$m")\`"
               echo "#### Baseline (MMQ - what ships today)"
