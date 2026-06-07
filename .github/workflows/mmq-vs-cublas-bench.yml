@@ -23,8 +23,8 @@ on:
         description: "llama.cpp ref to build (blank = the ref that triggered this)"
         default: ""
       prompt_sizes:
-        description: "llama-bench -p (prefill batch sizes, the decision-relevant numbers)"
-        default: "512,2048"
+        description: "llama-bench -p (prefill batch sizes; a context sweep measures the tok/s-vs-context decay)"
+        default: "512,4096,32768,131072"
       gen_tokens:
         description: "llama-bench -n (decode tokens)"
         default: "128"
@@ -45,7 +45,7 @@ jobs:
     env:
       MODEL_URLS: ${{ inputs.model_url || 'https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q8_0.gguf' }}
       CUDA_ARCH: "86-real"
-      PROMPT_SIZES: ${{ inputs.prompt_sizes || '512,2048' }}
+      PROMPT_SIZES: ${{ inputs.prompt_sizes || '512,4096,32768,131072' }}
       GEN: ${{ inputs.gen_tokens || '128' }}
       FA: ${{ inputs.flash_attn || '1' }}
       NGL: "99"
