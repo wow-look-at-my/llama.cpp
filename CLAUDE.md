@@ -47,10 +47,31 @@ Tensors (see `src/models/gemma4-assistant.cpp` `load_arch_tensors`):
   `mtp.token_ordering.weight {n_vocab}`.
 
 KV keys (`gemma4_assistant.*`; see `src/llama-arch.cpp` and `load_arch_hparams`):
-standard `block_count`/`embedding_length`/`attention.*`/`rope.*` plus
-`n_embd_backbone` (**required, must equal the target's `n_embd`**),
-`use_ordered_embeddings`, `n_centroids`, `centroid_top_k`, `attention.k_eq_v`,
-`requires_target_arch`.
+standard `block_count`/`embedding_length`/`feed_forward_length`/
+`attention.head_count`, plus Gemma 4's global-vs-local split which the converter
+MUST emit in full:
+- `attention.head_count_kv` — emit a **per-layer array** when
+  `num_global_key_value_heads` differs from `num_key_value_heads` (full vs
+  sliding layers), not a scalar.
+- `attention.key_length`/`value_length` (global head dim) **and**
+  `attention.key_length_swa`/`value_length_swa` (sliding head dim).
+- `rope.freq_base`/`rope.dimension_count` (global) **and**
+  `rope.freq_base_swa`/`rope.dimension_count_swa` (sliding). Omitting
+  `rope.dimension_count_swa` is a *silent* bug: `load_hparams`
+  (`src/llama-model.cpp`) defaults `n_rot_swa` to `n_rot_full`, so the drafter
+  would RoPE the global head dim on the narrower sliding heads.
+- `attention.sliding_window`, `attention.sliding_window_pattern` (`[]bool`,
+  len = n_layer, **required**), `attention.shared_kv_layers`.
+
+Assistant-specific: `n_embd_backbone` (**required, must equal the target's
+`n_embd`**), `use_ordered_embeddings`, `n_centroids`, `centroid_top_k`,
+`attention.k_eq_v`, `requires_target_arch`.
+
+> Cross-checked against Google's `google/gemma-4-31B-it-assistant` checkpoint
+> (`Gemma4AssistantForCausalLM`): `backbone_hidden_size` 5376 == target
+> `gemma-4-31B-it` `hidden_size`; head dims 256 (sliding) / 512 (full); KV heads
+> 16 (sliding) / 4 (full); `requires_target_arch` absent (so the converter omits
+> it).
 
 The ollama-side converter that produces this file is
 `convert.ConvertGemma4MTPDraft` (`convert/convert_gemma4.go`) — keep the two in
