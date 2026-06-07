@@ -394,7 +394,7 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_graph(const llm_graph_params &) const {
+[[noreturn]] std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_graph(const llm_graph_params &) const {
     throw std::runtime_error(
         "gemma4_assistant cannot be used as a primary model (-m). "
         "Load the Gemma 4 target with -m, then call llama_model_load_mtp_from_file() with the assistant GGUF.");
