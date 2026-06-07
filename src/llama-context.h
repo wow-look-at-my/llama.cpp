@@ -138,6 +138,27 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // Gemma 4 MTP: greedy multi-step draft using the nested gemma4_assistant model
+    // cross-attending the target's already-stored KV cache. Runs n_steps single-token
+    // graphs on a dedicated scheduler (sched_mtp); each step's in-graph argmax feeds the
+    // next step's last_token and its post hidden-state feeds the next step's h_prev.
+    //   seq_id   : target sequence whose stored KV is cross-attended
+    //   attn_pos : last accepted position; step k uses pos attn_pos + 1 + k
+    //   last_token / h_prev : seed token id and backbone hidden state [n_embd_backbone]
+    //   out_drafts        : [n_steps] drafted token ids
+    //   out_logits        : optional [n_steps * n_vocab] per-step logits (NULL to skip)
+    //   out_h_prev_last   : optional [n_embd_backbone] final hidden state
+    // Synchronous for now; an async overlap worker is a later addition.
+    int32_t decode_mtp(
+            llama_seq_id  seq_id,
+            llama_pos     attn_pos,
+            llama_token   last_token,
+            float       * h_prev,
+            int32_t       n_steps,
+            llama_token * out_drafts,
+            float       * out_logits,
+            float       * out_h_prev_last);
+
     //
     // state save/load
     //
@@ -251,6 +272,25 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
+    // graph params for an MTP draft step: arch/hparams come from the assistant model,
+    // gtype is LLM_GRAPH_TYPE_MTP, everything else mirrors graph_params().
+    llm_graph_params graph_params_mtp(
+                        llm_graph_result * res,
+                      const llama_ubatch & ubatch,
+            const llama_memory_context_i * mctx) const;
+
+    // Lazily create sched_mtp and reserve its compute buffers on the first MTP call.
+    bool ensure_sched_mtp();
+
+    // Run the MTP graph for one ubatch on sched_mtp / gf_res_prev_mtp. Mirrors
+    // process_ubatch() but is isolated on the dedicated MTP scheduler.
+    llm_graph_result * process_ubatch_mtp(
+                const llama_ubatch & ubatch,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret);
+
+    ggml_status graph_compute_mtp(ggml_cgraph * gf);
+
     llm_graph_cb graph_get_cb() const;
 
     // TODO: read/write lora adapters and cvec
@@ -349,6 +389,12 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Gemma 4 MTP: dedicated scheduler + graph cache so the draft graph is encoded
+    // and reused independently of the target's sched / gf_res_prev. Created lazily by
+    // ensure_sched_mtp() on the first decode_mtp() call.
+    ggml_backend_sched_ptr sched_mtp;
+    llm_graph_result_ptr   gf_res_prev_mtp;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

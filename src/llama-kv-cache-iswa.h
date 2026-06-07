@@ -43,6 +43,15 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    // Gemma 4 MTP draft step: build a read-only memory context that points at the
+    // LAST stored cell (max position) of seq_id for BOTH the base and SWA sub-caches.
+    // The assistant graph (LLM_GRAPH_TYPE_MTP) cross-attends the target's already-stored
+    // KV; it never writes new cells, so this never allocates a slot. The snapshot of slot
+    // info captured here must remain valid until the MTP graph finishes computing — the
+    // append-only KV cache (all MTP step positions strictly > max stored pos) satisfies
+    // this without rollback.
+    llama_memory_context_ptr init_mtp(llama_seq_id seq_id, llama_ubatch ubatch);
+
     bool get_can_shift() const override;
 
     void clear(bool data) override;

@@ -57,6 +57,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GEMMA3,           "gemma3"           },
     { LLM_ARCH_GEMMA3N,          "gemma3n"          },
     { LLM_ARCH_GEMMA4,           "gemma4"           },
+    { LLM_ARCH_GEMMA4_ASSISTANT, "gemma4_assistant" },
     { LLM_ARCH_GEMMA_EMBEDDING,  "gemma-embedding"  },
     { LLM_ARCH_STARCODER2,       "starcoder2"       },
     { LLM_ARCH_MAMBA,            "mamba"            },
@@ -294,6 +295,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DENSE_3_FEAT_IN,        "%s.dense_3_feat_in"   },
     { LLM_KV_DENSE_3_FEAT_OUT,       "%s.dense_3_feat_out"  },
 
+    // gemma4 MTP assistant (drafter) metadata
+    { LLM_KV_GEMMA4_ASSISTANT_N_CENTROIDS,            "%s.n_centroids"            },
+    { LLM_KV_GEMMA4_ASSISTANT_CENTROID_TOP_K,         "%s.centroid_top_k"         },
+    { LLM_KV_GEMMA4_ASSISTANT_N_EMBD_BACKBONE,        "%s.n_embd_backbone"        },
+    { LLM_KV_GEMMA4_ASSISTANT_ATTENTION_K_EQ_V,       "%s.attention.k_eq_v"       },
+    { LLM_KV_GEMMA4_ASSISTANT_USE_ORDERED_EMBEDDINGS, "%s.use_ordered_embeddings" },
+    { LLM_KV_GEMMA4_ASSISTANT_REQUIRES_TARGET_ARCH,   "%s.requires_target_arch"   },
+
     { LLM_KV_TOKENIZER_MODEL,                "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                  "tokenizer.ggml.pre"                      },
     { LLM_KV_TOKENIZER_LIST,                 "tokenizer.ggml.tokens"                   },
@@ -348,6 +357,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
     { LLM_TENSOR_OUTPUT,                                 "output" },
+    { LLM_TENSOR_MTP_PRE_PROJECTION,                     "mtp.pre_projection" },
+    { LLM_TENSOR_MTP_POST_PROJECTION,                    "mtp.post_projection" },
+    { LLM_TENSOR_MTP_CENTROIDS,                          "mtp.centroids" },
+    { LLM_TENSOR_MTP_TOKEN_ORDERING,                     "mtp.token_ordering" },
     { LLM_TENSOR_ROPE_FREQS,                             "rope_freqs" },
     { LLM_TENSOR_ATTN_NORM,                              "blk.%d.attn_norm" },
     { LLM_TENSOR_ATTN_Q,                                 "blk.%d.attn_q" },
@@ -568,6 +581,11 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_EMBD_NORM,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},  // do the norms on the first layer (not the input layer)
     {LLM_TENSOR_OUTPUT,                     {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    // gemma4 MTP assistant (drafter) tensors
+    {LLM_TENSOR_MTP_PRE_PROJECTION,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_POST_PROJECTION,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_CENTROIDS,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MTP_TOKEN_ORDERING,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     {LLM_TENSOR_CLS,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS_OUT,                    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CLS_NORM,                   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},

@@ -188,6 +188,11 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // Gemma 4 MTP: read-only slot pointing at the LAST stored cell (max position) of
+    // seq_id. Allocates nothing — the MTP draft graph only cross-attends already-stored
+    // KV (see llama_kv_cache_iswa::init_mtp). Returns a single-index slot_info.
+    slot_info mtp_slot_info(llama_seq_id seq_id) const;
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 

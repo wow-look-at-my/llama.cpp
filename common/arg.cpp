@@ -3635,6 +3635,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
     add_opt(common_arg(
+        {"--mtp-head"}, "FNAME",
+        "Gemma 4 MTP: path to the gemma4_assistant GGUF, loaded into the target model "
+        "(implies --spec-type gemma4-mtp; cross-attends the target KV, no second context)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mparams.path = value;
+            const bool has_gemma4_mtp = std::find(
+                    params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_GEMMA4_MTP) != params.speculative.types.end();
+            if (!has_gemma4_mtp) {
+                params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_GEMMA4_MTP);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MTP_HEAD"));
+    add_opt(common_arg(
         {"--spec-type"}, common_speculative_all_types_str(),
         string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
             common_speculative_type_name_str(params.speculative.types).c_str()),

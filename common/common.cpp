@@ -1229,6 +1229,41 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
+    // Gemma 4 MTP: load the gemma4_assistant INTO the target model (single context).
+    // Unlike a draft model, the assistant has no context/KV of its own - it cross-attends
+    // the target's stored KV. The speculative driver later drives it via llama_decode_mtp().
+    {
+        const bool has_gemma4_mtp = std::find(
+                params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_GEMMA4_MTP) != params.speculative.types.end();
+
+        if (has_gemma4_mtp) {
+            if (params.speculative.draft.mparams.path.empty()) {
+                LOG_ERR("%s: gemma4-mtp requires --mtp-head (or --spec-draft-model) with a local GGUF path\n", __func__);
+                pimpl->model.reset();
+                return;
+            }
+
+            common_params p_mtp = params;
+            p_mtp.model        = params.speculative.draft.mparams;
+            p_mtp.devices      = params.speculative.draft.devices;
+            p_mtp.n_gpu_layers = params.speculative.draft.n_gpu_layers;
+            p_mtp.cache_type_k = params.speculative.draft.cache_type_k;
+            p_mtp.cache_type_v = params.speculative.draft.cache_type_v;
+            p_mtp.tensor_buft_overrides = params.speculative.draft.tensor_buft_overrides;
+
+            llama_model_params mparams_mtp = common_model_params_to_llama(p_mtp);
+            const char * path_mtp = params.speculative.draft.mparams.path.c_str();
+
+            LOG_INF("%s: loading gemma4 MTP assistant '%s' into target model\n", __func__, path_mtp);
+            if (llama_model_load_mtp_from_file(model, path_mtp, mparams_mtp) != 0) {
+                LOG_ERR("%s: failed to load gemma4 MTP assistant from '%s'\n", __func__, path_mtp);
+                pimpl->model.reset();
+                return;
+            }
+        }
+    }
+
     // updates params.sampling
     // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);

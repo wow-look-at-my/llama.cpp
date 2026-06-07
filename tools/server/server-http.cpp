@@ -233,6 +233,20 @@ bool server_http_context::init(const common_params & params) {
 
     auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
         if (!is_ready.load()) {
+            // Ollama compat: report model-load progress on the health endpoints
+            // while the model loads so the scheduler can surface a real 0..1
+            // fraction. Other endpoints keep returning the generic 503 below.
+            if (req.path == "/health" || req.path == "/v1/health") {
+                res.status = 503;
+                res.set_content(
+                    safe_json_to_str(json {
+                        {"status",   "loading model"},
+                        {"progress", server_load_progress().load()},
+                    }),
+                    "application/json; charset=utf-8"
+                );
+                return false;
+            }
 #if defined(LLAMA_UI_HAS_ASSETS)
             if (const auto tmp = string_split<std::string>(req.path, '.');
                 req.path == "/" || (!tmp.empty() && tmp.back() == "html")) {
