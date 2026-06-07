@@ -16,9 +16,13 @@ on:
         description: "Skip the s390x build target (useful for fast test runs that do not need the IBM Z runner)"
         type: boolean
         default: false
-  schedule:
-    # Rebuild daily rather than on every push because it is expensive
-    - cron: '12 4 * * *'
+  # Scheduled daily runs are disabled: the linux/s390x leg has no IBM Z runner
+  # in this repo and sits queued for ~24h until GitHub cancels it, while the rest
+  # of the matrix burns free Actions minutes every day. Trigger a rebuild manually
+  # via workflow_dispatch (use skip_s390x to skip the IBM Z leg) when needed.
+  # schedule:
+  #   # Rebuild daily rather than on every push because it is expensive
+  #   - cron: '12 4 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
