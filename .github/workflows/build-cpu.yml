@@ -60,7 +60,38 @@ jobs:
   build-cmake-pkg:
     uses: ./.github/workflows/build-cmake-pkg.yml
 
+  # Download the shared test model exactly once, cache it, then let every build
+  # leg restore it from the cache (instead of each leg hammering HuggingFace and
+  # tripping its rate limit). download-models.cmake skips the network when the
+  # file already exists with the expected hash, so a restored cache = no fetch.
+  fetch-models:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Cache test models
+        id: cache-models
+        uses: actions/cache@v5
+        with:
+          path: build/tinyllamas
+          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          restore-keys: |
+            ggml-ci-models-
+
+      - name: Download test models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # Read model name/hash from the test definition so this never drifts.
+          NAME=$(grep -oP 'set\(MODEL_NAME "\K[^"]+' tests/CMakeLists.txt | head -1)
+          HASH=$(grep -oP 'set\(MODEL_HASH "\K[^"]+' tests/CMakeLists.txt | head -1)
+          echo "Ensuring $NAME ($HASH) is present"
+          cmake -DDEST="$PWD/build/$NAME" -DNAME="$NAME" -DHASH="$HASH" \
+            -P cmake/download-models.cmake
+
   ubuntu:
+    needs: fetch-models
     strategy:
       matrix:
         include:
@@ -114,24 +145,40 @@ jobs:
             -DGGML_RPC=ON
           time cmake --build build --config Release -j $(nproc)
 
+      - name: Restore cached test models
+        uses: actions/cache/restore@v5
+        with:
+          path: build/tinyllamas
+          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          restore-keys: |
+            ggml-ci-models-
+
       - name: Test
         id: cmake_test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd build
           ctest -L main --verbose --timeout 900
 
       - name: Test llama2c conversion
         id: llama2c_test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd build
+          # Authenticate to HuggingFace when a token is available (avoids 429s).
+          auth=()
+          [ -n "${HF_TOKEN:-}" ] && auth=(--header="Authorization: Bearer ${HF_TOKEN}")
           echo "Fetch tokenizer"
-          wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/tok512.bin
+          wget "${auth[@]}" https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/tok512.bin
           echo "Fetch llama2c model"
-          wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
+          wget "${auth[@]}" https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
           ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   windows:
+    needs: fetch-models
     runs-on: windows-2025
 
     env:
@@ -209,9 +256,20 @@ jobs:
           cp $env:RUNNER_TEMP/openblas/bin/libopenblas.dll ./build/bin/Release/openblas.dll
           cp $env:RUNNER_TEMP/OpenBLAS.LICENSE.txt ./build/bin/Release/OpenBLAS-${env:OPENBLAS_VERSION}.txt
 
+      - name: Restore cached test models
+        if: ${{ matrix.arch == 'x64' }}
+        uses: actions/cache/restore@v5
+        with:
+          path: build/tinyllamas
+          key: ggml-ci-models-${{ hashFiles('tests/CMakeLists.txt') }}
+          restore-keys: |
+            ggml-ci-models-
+
       - name: Test
         id: cmake_test
         if: ${{ matrix.arch == 'x64' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd build
           ctest -L main -C Release --verbose --timeout 900
