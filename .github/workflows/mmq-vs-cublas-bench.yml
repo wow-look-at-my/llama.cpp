@@ -1,51 +1,39 @@
-# Manual A/B benchmark: MMQ (quantized int8 kernels) vs cuBLAS-dequant, on the
-# self-hosted A6000 (sm_86). Settles whether the 21 mmq template instances earn
-# their compile time, or whether forcing cuBLAS is a net win for our shapes.
+# MMQ (quantized int8 kernels) vs cuBLAS-dequant, measured on the self-hosted
+# A6000 (sm_86). Self-contained: fetches its own public gguf, builds llama-bench
+# twice (baseline MMQ, and -DGGML_CUDA_FORCE_CUBLAS=ON), benches both, posts a
+# side-by-side table to the run summary (and to the step log, so it's readable
+# via `gh run view --log`).
 #
-# It is workflow_dispatch ONLY: it never auto-runs on the GPU box. You trigger it,
-# supply the model path + CUDA image, and it builds llama-bench TWICE
-# (baseline=MMQ, and -DGGML_CUDA_FORCE_CUBLAS=ON) then benches both, posting a
-# side-by-side markdown table to the run summary.
+# Triggers on a push that touches this file (so iterating on it re-runs the
+# bench), and via manual dispatch. NOT on every push — it's a ~30 min GPU job.
 #
-# Note: GGML_CUDA_FORCE_CUBLAS only flips the runtime dispatch (ggml_cuda_should_use_mmq
-# hard-returns false); both builds still COMPILE the mmq instances. So this measures
-# the runtime question. The compile win (dropping the 21 instances) is only worth
-# taking IF cuBLAS ties-or-wins here.
+# GGML_CUDA_FORCE_CUBLAS only flips runtime dispatch (ggml_cuda_should_use_mmq
+# hard-returns false); both builds still compile the mmq instances. So this
+# answers the *runtime* question. Dropping the 21 instances (~264s compile) is
+# only worth it if cuBLAS ties-or-wins here.
 name: mmq-vs-cublas-bench
 
 on:
   workflow_dispatch:
     inputs:
-      model_dir:
-        description: "Host directory containing the .gguf (mounted read-only into the build container)"
-        required: true
-      model_file:
-        description: "Filename of the .gguf inside model_dir (e.g. gemma4-q4_K_M.gguf)"
-        required: true
+      hf_repo:
+        description: "HF GGUF repo to bench"
+        default: "Qwen/Qwen2.5-7B-Instruct-GGUF"
+      hf_glob:
+        description: "Which gguf(s) to pull"
+        default: "*q4_k_m*.gguf"
       cuda_image:
-        description: "CUDA devel image to build in — must match your driver. Override if 13.x is too new."
-        required: false
+        description: "CUDA devel image (match the box driver)"
         default: "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-      cuda_arch:
-        description: "CUDA arch (A6000 = 86-real)"
-        required: false
-        default: "86-real"
       prompt_sizes:
-        description: "llama-bench -p (prefill batch sizes). Set to your real prompt profile."
-        required: false
+        description: "llama-bench -p (prefill batch sizes)"
         default: "512,2048"
       gen_tokens:
         description: "llama-bench -n (decode tokens)"
-        required: false
         default: "128"
-      ngl:
-        description: "GPU layers to offload (99 = all)"
-        required: false
-        default: "99"
-      flash_attn:
-        description: "Flash attention (1 to match the MTP serving config)"
-        required: false
-        default: "1"
+  push:
+    paths:
+      - .github/workflows/mmq-vs-cublas-bench.yml
 
 concurrency:
   group: mmq-bench
@@ -55,50 +43,67 @@ jobs:
   bench:
     runs-on: [self-hosted, gpu, nvidia]
     container:
-      image: ${{ inputs.cuda_image }}
+      image: ${{ inputs.cuda_image || 'nvidia/cuda:13.0.1-devel-ubuntu24.04' }}
       options: --gpus all
-      volumes:
-        - ${{ inputs.model_dir }}:/models:ro
+    env:
+      HF_REPO: ${{ inputs.hf_repo || 'Qwen/Qwen2.5-7B-Instruct-GGUF' }}
+      HF_GLOB: ${{ inputs.hf_glob || '*q4_k_m*.gguf' }}
+      CUDA_ARCH: "86-real"
+      PROMPT_SIZES: ${{ inputs.prompt_sizes || '512,2048' }}
+      GEN: ${{ inputs.gen_tokens || '128' }}
+      NGL: "99"
+      FA: "1"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain
+      - name: Toolchain + GPU check
         run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends cmake ninja-build git ca-certificates build-essential
-          nvidia-smi || { echo "::error::no GPU visible in container — check --gpus all / driver"; exit 1; }
-          test -f "/models/${{ inputs.model_file }}" || { echo "::error::/models/${{ inputs.model_file }} not found — check model_dir/model_file"; exit 1; }
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build git curl ca-certificates build-essential python3-pip
+          pip3 install -q --break-system-packages "huggingface_hub[cli]" || pip3 install -q "huggingface_hub[cli]"
+          nvidia-smi || { echo "::error::no GPU in container (--gpus all / driver)"; exit 1; }
 
-      - name: Build (MMQ baseline + FORCE_CUBLAS)
+      - name: Fetch model
+        run: |
+          set -euxo pipefail
+          huggingface-cli download "$HF_REPO" --include "$HF_GLOB" --local-dir models
+          M=$(find models -name '*.gguf' | sort | head -1)
+          test -n "$M" || { echo "::error::no gguf matched $HF_GLOB in $HF_REPO"; exit 1; }
+          echo "MODEL=$M" >> "$GITHUB_ENV"
+          ls -lh "$M"
+
+      - name: Build llama-bench (MMQ baseline + FORCE_CUBLAS)
         run: |
           set -euxo pipefail
           for v in mmq cublas; do
-            extra=""
-            [ "$v" = cublas ] && extra="-DGGML_CUDA_FORCE_CUBLAS=ON"
-            cmake -S . -B "build-$v" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DGGML_CUDA=ON \
-              -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.cuda_arch }}" \
-              $extra
+            args=(-S . -B "build-$v" -G Ninja
+                  -DCMAKE_BUILD_TYPE=Release
+                  -DGGML_CUDA=ON
+                  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH")
+            if [ "$v" = cublas ]; then args+=(-DGGML_CUDA_FORCE_CUBLAS=ON); fi
+            cmake "${args[@]}"
             cmake --build "build-$v" --target llama-bench
           done
-          # prove the define actually took for the cublas build
           grep -q 'GGML_CUDA_FORCE_CUBLAS:BOOL=ON' build-cublas/CMakeCache.txt \
             || { echo "::error::FORCE_CUBLAS define did not stick"; exit 1; }
 
-      - name: Benchmark both
+      - name: Benchmark
         run: |
           set -uxo pipefail
-          M="/models/${{ inputs.model_file }}"
-          common="-m $M -ngl ${{ inputs.ngl }} -p ${{ inputs.prompt_sizes }} -n ${{ inputs.gen_tokens }} -fa ${{ inputs.flash_attn }} -r 3 -o md"
+          common=(-m "$MODEL" -ngl "$NGL" -p "$PROMPT_SIZES" -n "$GEN" -fa "$FA" -r 3 -o md)
           {
-            echo "## MMQ vs cuBLAS — sm_86 (\`${{ inputs.cuda_arch }}\`)"
-            echo '```'; nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; echo '```'
-            echo "Model: \`${{ inputs.model_file }}\`  •  prompt sizes: \`${{ inputs.prompt_sizes }}\`  •  gen: \`${{ inputs.gen_tokens }}\`  •  fa: \`${{ inputs.flash_attn }}\`"
+            echo "## MMQ vs cuBLAS — sm_86 (\`$CUDA_ARCH\`)"
+            echo '```'
+            nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+            echo '```'
+            echo "Model: \`$(basename "$MODEL")\`  •  -p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`"
             echo
             echo "### Baseline (MMQ — what ships today)"
-            ./build-mmq/bin/llama-bench $common
+            ./build-mmq/bin/llama-bench "${common[@]}"
             echo
             echo "### GGML_CUDA_FORCE_CUBLAS=ON (mmq instances unused)"
-            ./build-cublas/bin/llama-bench $common
+            ./build-cublas/bin/llama-bench "${common[@]}"
           } | tee -a "$GITHUB_STEP_SUMMARY"

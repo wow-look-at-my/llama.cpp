@@ -1,0 +1,5 @@
+# Custom labels for the self-hosted A6000 runner (see org runner: unraid-gpu-runner).
+self-hosted-runner:
+  labels:
+    - gpu
+    - nvidia
