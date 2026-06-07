@@ -826,7 +826,10 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
-    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+    // Always throws: the assistant cannot be a primary model (see definition).
+    // Marked noreturn so -Wsuggest-attribute=noreturn (fatal under
+    // -DLLAMA_FATAL_WARNINGS) does not flag it; standard attribute, clang-safe.
+    [[noreturn]] std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
 

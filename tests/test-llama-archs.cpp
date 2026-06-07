@@ -394,6 +394,11 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_GEMMA4) {
         return false; // FIXME @ngxson
     }
+    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return false; // Not a standalone model: the MTP assistant head is loaded into
+                      // the Gemma 4 target; it cannot be loaded/run via -m (its
+                      // build_arch_graph throws), so it is excluded from this sweep.
+    }
     if (arch == LLM_ARCH_LLAMA_EMBED || arch == LLM_ARCH_GEMMA_EMBEDDING || arch == LLM_ARCH_T5ENCODER) {
         return false; // FIXME Embedding (?) models produce inconsistent results.
     }
