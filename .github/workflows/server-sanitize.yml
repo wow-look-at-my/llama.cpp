@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   server:
-    runs-on: [self-hosted, CPU, Linux, llama-server]
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
