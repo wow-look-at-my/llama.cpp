@@ -39,8 +39,12 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
+    const bool spec_gemma4_mtp = std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_GEMMA4_MTP) != params.speculative.types.end();
 
     if (params.embedding ||
+            spec_gemma4_mtp ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
         return n_batch;
     }
