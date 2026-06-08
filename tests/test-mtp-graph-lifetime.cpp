@@ -54,11 +54,21 @@
 #include "../src/llama-graph.h"
 #include "../src/models/models.h"
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
+
+// Always-on check (the test is built with -DNDEBUG, so assert() would be a no-op).
+static int g_failures = 0;
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            fprintf(stderr, "FAILED: %s  (%s:%d)\n", #cond, __FILE__, __LINE__); \
+            ++g_failures;                                                        \
+        }                                                                        \
+    } while (0)
 
 // ---------------------------------------------------------------------------
 // (1) Compile-time guards on the REAL graph_mtp type.
@@ -185,21 +195,23 @@ static void capture_dangling_binding(
 // (2) graph_mtp_params_owner makes an independent deep copy of the params.
 // ---------------------------------------------------------------------------
 static void test_owner_makes_independent_copy() {
+    const int before = g_failures;
     llm_graph_result res(64);
     llama_hparams hp = make_min_hparams(/*n_embd*/ 4242);
     llm_graph_params src = make_params(res, hp, LLM_ARCH_GEMMA4_ASSISTANT, nullptr);
 
     mtp_owner_t owner(src);   // the REAL fix type
 
-    assert(owner.params_owned.hparams.n_embd == 4242);
-    assert(&owner.params_owned       != &src);          // distinct storage
-    assert(&owner.params_owned.hparams != &src.hparams); // distinct storage
+    CHECK(owner.params_owned.hparams.n_embd == 4242);
+    CHECK(&owner.params_owned       != &src);          // distinct storage
+    CHECK(&owner.params_owned.hparams != &src.hparams); // distinct storage
 
     // Mutating the source must not touch the owned copy.
     src.hparams.n_embd = 9999;
-    assert(owner.params_owned.hparams.n_embd == 4242);
+    CHECK(owner.params_owned.hparams.n_embd == 4242);
 
-    printf("  ok: graph_mtp_params_owner makes an independent deep copy\n");
+    printf("  %s: graph_mtp_params_owner makes an independent deep copy\n",
+           g_failures == before ? "ok" : "FAIL");
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +219,7 @@ static void test_owner_makes_independent_copy() {
 // survive the source params being destroyed and point into the owned copy.
 // ---------------------------------------------------------------------------
 static void test_references_survive_source_destruction() {
+    const int before = g_failures;
     llm_graph_result res(64);
     const llama_hparams target_hp    = make_min_hparams(111);
     const llama_hparams assistant_hp = make_min_hparams(222);
@@ -223,28 +236,29 @@ static void test_references_survive_source_destruction() {
     // build_arch_graph() returned and destroyed its local params copy.
 
     // The references must NOT point into the destroyed local copy...
-    assert((const void *) &ctx->hparams != local_hparams_addr);
+    CHECK((const void *) &ctx->hparams != local_hparams_addr);
 
     // ...they must alias the graph object's OWN params copy instead.
-    assert(&ctx->hparams == &ctx->owned()->hparams);
-    assert(&ctx->cparams == &ctx->owned()->cparams);
-    assert(&ctx->ubatch  == &ctx->owned()->ubatch);
-    assert(&ctx->cb_func == &ctx->owned()->cb);
+    CHECK(&ctx->hparams == &ctx->owned()->hparams);
+    CHECK(&ctx->cparams == &ctx->owned()->cparams);
+    CHECK(&ctx->ubatch  == &ctx->owned()->ubatch);
+    CHECK(&ctx->cb_func == &ctx->owned()->cb);
 
     // The owned copy captured the assistant arch/hparams build_arch_graph swapped
     // in, and the sentinel ubatch -- reading through the references is safe and
     // correct.
-    assert(ctx->arch            == LLM_ARCH_GEMMA4_ASSISTANT);
-    assert(ctx->hparams.n_embd  == 222);
-    assert(ctx->n_embd          == 222);   // derived scalar, computed in the ctor
-    assert(ctx->ubatch.n_tokens == 7);
+    CHECK(ctx->arch            == LLM_ARCH_GEMMA4_ASSISTANT);
+    CHECK(ctx->hparams.n_embd  == 222);
+    CHECK(ctx->n_embd          == 222);   // derived scalar, computed in the ctor
+    CHECK(ctx->ubatch.n_tokens == 7);
 
     // Invoking cb() -- as build_pooling() does -- must be safe and dispatch through
     // the owned callback (this is the exact call that GP-faulted pre-fix).
     ctx->cb(nullptr, "mtp_test", -1);
-    assert(cb_calls == 1);
+    CHECK(cb_calls == 1);
 
-    printf("  ok: graph context references survive source-params destruction\n");
+    printf("  %s: graph context references survive source-params destruction\n",
+           g_failures == before ? "ok" : "FAIL");
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +266,7 @@ static void test_references_survive_source_destruction() {
 // references to the local copy that build_arch_graph destroys on return.
 // ---------------------------------------------------------------------------
 static void test_prefix_layout_binds_to_dying_local() {
+    const int before = g_failures;
     llm_graph_result res(64);
     const llama_hparams target_hp    = make_min_hparams(111);
     const llama_hparams assistant_hp = make_min_hparams(333);
@@ -265,10 +280,11 @@ static void test_prefix_layout_binds_to_dying_local() {
     // i.e. exactly the pointer that would dangle once build_arch_graph returned.
     // (Both objects are already destroyed; we compare only addresses captured while
     // they were alive and never dereference them.)
-    assert(local_hparams_addr != nullptr);
-    assert(local_hparams_addr == ctx_hparams_addr);
+    CHECK(local_hparams_addr != nullptr);
+    CHECK(local_hparams_addr == ctx_hparams_addr);
 
-    printf("  ok: pre-fix layout binds references to the dying local copy\n");
+    printf("  %s: pre-fix layout binds references to the dying local copy\n",
+           g_failures == before ? "ok" : "FAIL");
 }
 
 int main() {
@@ -276,6 +292,10 @@ int main() {
     test_references_survive_source_destruction();
     test_prefix_layout_binds_to_dying_local();
 
+    if (g_failures != 0) {
+        fprintf(stderr, "test-mtp-graph-lifetime: %d check(s) FAILED\n", g_failures);
+        return 1;
+    }
     printf("test-mtp-graph-lifetime: all checks passed\n");
     return 0;
 }
