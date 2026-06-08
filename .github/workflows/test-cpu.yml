@@ -1,0 +1,46 @@
+name: CI (CPU tests)
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential ninja-build libgomp1 git libssl-dev
+
+      - name: Configure (CPU only)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DGGML_CUDA=OFF \
+            -DGGML_NATIVE=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF
+
+      # CPU-side regression test for the Gemma 4 MTP graph-context use-after-free.
+      # Builds and runs only this self-contained test (no model weights, no GPU).
+      - name: Build MTP graph-lifetime test
+        run: cmake --build build --target test-mtp-graph-lifetime -j$(nproc)
+
+      - name: Run MTP graph-lifetime test
+        run: ctest --test-dir build -R '^test-mtp-graph-lifetime$' --output-on-failure
