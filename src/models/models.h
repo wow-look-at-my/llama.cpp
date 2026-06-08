@@ -818,10 +818,24 @@ struct llama_model_gemma4 : public llama_model_base {
         ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
     };
 
+    // Owns a copy of the (assistant-adjusted) llm_graph_params. llm_graph_context binds its
+    // hparams/cparams/ubatch/cb members BY REFERENCE to the params it is constructed from, so
+    // that params must outlive the graph context. build_arch_graph() builds the MTP graph from a
+    // LOCAL params copy (it swaps arch/hparams to the assistant) which dies on return, while
+    // llama_model::build_graph() keeps using the context afterwards (build_pooling/build_sampling/
+    // set_outputs) — those would dereference dangling references (notably cb -> garbage `this` ->
+    // n_gpu_layers() GP fault). Holding the copy here keeps it alive for the graph's lifetime.
+    // Must be declared before llm_graph_context: base subobjects init in declaration order, so the
+    // owned copy exists before llm_graph_context binds its references to it.
+    struct graph_mtp_params_owner {
+        llm_graph_params params_owned;
+        explicit graph_mtp_params_owner(const llm_graph_params & p) : params_owned(p) {}
+    };
+
     // Gemma 4 MTP draft head (built when params.gtype == LLM_GRAPH_TYPE_MTP). Unlike Qwen's
     // in-model NextN, the gemma4 assistant is a SEPARATE model that cross-attends the target's
     // stored KV. The target (this model) supplies tok_embd + KV; `mtp` supplies assistant weights.
-    struct graph_mtp : public llm_graph_context {
+    struct graph_mtp : private graph_mtp_params_owner, public llm_graph_context {
         graph_mtp(const llama_model & target, const llama_model & mtp, const llm_graph_params & params);
 
         const llama_model & target;
