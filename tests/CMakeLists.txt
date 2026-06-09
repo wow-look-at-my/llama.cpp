@@ -192,6 +192,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    llama_build_and_test(test-mtp-graph-lifetime.cpp)
+    # models.h lives in src/models/ and includes sibling headers from src/ (e.g.
+    # "llama-model.h"), so the test needs src/ on its include path.
+    target_include_directories(test-mtp-graph-lifetime PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

@@ -87,6 +87,8 @@ llama-server -m gemma4-target.gguf --spec-type gemma4-mtp --mtp-head gemma4-assi
 
 - `src/llama-arch.{h,cpp}` — `LLM_ARCH_GEMMA4_ASSISTANT`, `mtp.*` tensor names, `LLM_KV_GEMMA4_ASSISTANT_*`
 - `src/models/gemma4-assistant.cpp` — hparams/tensor load + the one-step drafter graph (centroid head, in-graph argmax)
+- `src/models/models.h` — `llama_model_gemma4::graph_mtp` + its `graph_mtp_params_owner` base (owns the `llm_graph_params` copy so the `llm_graph_context` references it binds don't dangle once `build_arch_graph`'s local copy dies)
 - `src/llama.cpp` — `llama_model_load_mtp_from_file`, `llama_mtp_vocab_matches`
 - `src/llama-graph.{h,cpp}` — `build_attn_mtp` (cross-attention into the target's KV)
 - `common/speculative.cpp`, `common/arg.cpp` — gemma4-mtp speculative driver, `--mtp-head`
+- `tests/test-mtp-graph-lifetime.cpp` — CPU-only regression test for the MTP graph-context use-after-free (the `graph_mtp` params-ownership / dangling-reference crash); static-asserts the ownership layout and checks the references survive the source `llm_graph_params` being destroyed
