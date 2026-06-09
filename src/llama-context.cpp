@@ -2618,6 +2618,10 @@ int32_t llama_context::decode_mtp(
         return 0;
     }
 
+    auto token_is_valid = [n_vocab](llama_token token) {
+        return token >= 0 && token < n_vocab;
+    };
+
     auto data = std::make_shared<llama_ubatch::data_t>();
     data->token.resize(1);
     data->embd.resize(n_bb);
@@ -2655,6 +2659,12 @@ int32_t llama_context::decode_mtp(
     // Sequential MTP draft on the dedicated sched_mtp: per step run a fresh single-token
     // graph; each step's argmax feeds the next step's last_token; h_post -> next h_prev.
     for (int32_t k = 0; k < n_steps; ++k) {
+        if (!token_is_valid(last_token)) {
+            LLAMA_LOG_ERROR("%s: invalid MTP last_token at step %d: %d (n_vocab = %d)\n",
+                    __func__, k, last_token, n_vocab);
+            return -9;
+        }
+
         data->token[0] = last_token;
         data->pos[0]   = attn_pos + 1 + (llama_pos) k;
         std::memcpy(data->embd.data(), h_prev, n_bb * sizeof(float));
@@ -2679,6 +2689,11 @@ int32_t llama_context::decode_mtp(
 
         int32_t best_i32 = 0;
         ggml_backend_tensor_get(t_arg, &best_i32, 0, sizeof(int32_t));
+        if (!token_is_valid((llama_token) best_i32)) {
+            LLAMA_LOG_ERROR("%s: invalid MTP argmax at step %d: %d (n_vocab = %d)\n",
+                    __func__, k, best_i32, n_vocab);
+            return -10;
+        }
         out_drafts[k] = (llama_token) best_i32;
 
         if (out_logits) {
