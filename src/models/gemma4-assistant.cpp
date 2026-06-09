@@ -258,7 +258,8 @@ llama_model_gemma4::graph_mtp::graph_mtp(
         const llama_model & target_,
         const llama_model & mtp_,
         const llm_graph_params & params) :
-        llm_graph_context(params),
+        graph_mtp_params_owner(params),
+        llm_graph_context(params_owned),
         target(target_),
         mtp(mtp_) {
     const int64_t n_bb = mtp.hparams.n_embd_backbone;
