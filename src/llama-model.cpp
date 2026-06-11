@@ -1486,6 +1486,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    const int64_t t_buf_alloc_us = ggml_time_us();
+
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
 
@@ -1569,6 +1571,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
 
+    LLAMA_LOG_INFO("%s: timing: backend weight buffers allocated in %.2f ms\n", __func__, (ggml_time_us() - t_buf_alloc_us)/1000.0);
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -1599,9 +1603,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        const int64_t t_start_us   = ggml_time_us();
+        const size_t  size_before  = ml.size_done;
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+        const double t_ms   = (ggml_time_us() - t_start_us)/1000.0;
+        const double sz_mib = (ml.size_done - size_before)/1024.0/1024.0;
+        LLAMA_LOG_INFO("%s: timing: tensor data for %s: %.2f MiB in %.2f ms (%.1f MiB/s)\n",
+                __func__, buf_map.empty() ? "(no buffer)" : ggml_backend_buffer_name(buf_map.begin()->second),
+                sz_mib, t_ms, t_ms > 0.0 ? sz_mib/(t_ms/1000.0) : 0.0);
     }
 
     if (use_mmap_buffer) {

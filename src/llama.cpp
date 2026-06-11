@@ -305,6 +305,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
 
+        int64_t t_phase_us = ggml_time_us();
+
         try {
             model->load_hparams(ml);
         } catch(const std::exception & e) {
@@ -313,11 +315,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+
+        LLAMA_LOG_INFO("%s: timing: hparams loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
+        t_phase_us = ggml_time_us();
+
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
+
+        LLAMA_LOG_INFO("%s: timing: vocab loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
 
         model->load_stats(ml);
         model->print_info();
@@ -327,9 +335,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        t_phase_us = ggml_time_us();
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        LLAMA_LOG_INFO("%s: timing: tensors loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

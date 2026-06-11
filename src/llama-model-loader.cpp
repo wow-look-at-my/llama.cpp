@@ -522,6 +522,8 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    const int64_t t_start_us = ggml_time_us();
+
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -817,6 +819,9 @@ llama_model_loader::llama_model_loader(
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+
+    LLAMA_LOG_INFO("%s: timing: GGUF metadata parsed in %.2f ms (%d KV pairs, %d tensors)\n",
+            __func__, (ggml_time_us() - t_start_us)/1000.0, n_kv, n_tensors);
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1347,7 +1352,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
+            const int64_t t_start_us = ggml_time_us();
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            const double t_ms = (ggml_time_us() - t_start_us)/1000.0;
+            const double sz_mib = mapping->size()/1024.0/1024.0;
+            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (prefetch/populate %s) took %.2f ms (%.1f MiB/s)\n",
+                    __func__, sz_mib, prefetch ? "on" : "off", t_ms, t_ms > 0.0 ? sz_mib/(t_ms/1000.0) : 0.0);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1517,6 +1527,15 @@ bool llama_model_loader::load_all_data(
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
+    }
+
+    if (use_mmap) {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: mmap (zero-copy for host buffers, synchronous pageable copies for device buffers)\n", __func__);
+    } else if (upload_backend) {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: async uploads via %zu x %.1f MiB pinned staging buffers (direct I/O: %s)\n",
+                __func__, n_buffers, buffer_size/1024.0/1024.0, alignment != 1 ? "yes" : "no");
+    } else {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: synchronous buffered reads + pageable copies\n", __func__);
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
