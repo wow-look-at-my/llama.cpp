@@ -29,3 +29,15 @@ per string (`gguf_writer::write(const std::string &)` in
 
 Until then: `string_view` into the retained mapping internally, lazy
 NUL-terminated shadow at the `const char *` entry points.
+
+## Tokenizer trie: replace `naive_trie`'s per-character `std::map` nodes
+
+`naive_trie` (src/llama-vocab.cpp) allocates one `std::map` red-black-tree node
+per character of every inserted token. It is only built for UGM (T5-style),
+RWKV, and PLaMo-2 vocabs - BPE/SPM (including Gemma 4) never construct it, and
+the `timing: tokenizer initialized` marker confirms ~0 ms there. A flat
+(sorted-range or double-array) replacement would cut load time for UGM/RWKV
+models, but the repo has no UGM/RWKV tokenizer conformance vocabs
+(models/ggml-vocab-*.gguf) to validate a rewrite against, so it was deferred
+rather than shipped untested. Add a t5/rwkv vocab + .inp/.out pair first, then
+rewrite the three traversal loops against a cursor-style flat trie.
