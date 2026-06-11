@@ -103,6 +103,21 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // optional host-memory registration (pinning) of the mappings via the device
+    // backend (e.g. cudaHostRegister), so that tensor uploads from the mapping run
+    // as DMA at full transfer rate instead of pageable-memory speed
+    typedef bool (*host_buffer_register_fn)  (void * buffer, size_t size);
+    typedef void (*host_buffer_unregister_fn)(void * buffer);
+
+    host_buffer_register_fn   host_register   = nullptr;
+    host_buffer_unregister_fn host_unregister = nullptr;
+
+    std::vector<void *> registered_mappings;
+
+    // bytes at the start of the main file (the GGUF metadata region) that stay
+    // mapped for the lifetime of the model - metadata/vocab string views point there
+    size_t meta_keep = 0;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -132,6 +147,11 @@ struct llama_model_loader {
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    ~llama_model_loader();
+
+    // undo host_register for all registered mappings (no-op if none)
+    void unregister_mappings();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

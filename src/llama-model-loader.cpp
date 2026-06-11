@@ -820,8 +820,27 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
 
+    // size of the metadata region of the main file - kept mapped for the model lifetime
+    if (!files.empty()) {
+        meta_keep = gguf_get_data_offset(metadata);
+    }
+
     LLAMA_LOG_INFO("%s: timing: GGUF metadata parsed in %.2f ms (%d KV pairs, %d tensors)\n",
             __func__, (ggml_time_us() - t_start_us)/1000.0, n_kv, n_tensors);
+}
+
+llama_model_loader::~llama_model_loader() {
+    // safety net for error paths: never destroy a still-registered mapping
+    unregister_mappings();
+}
+
+void llama_model_loader::unregister_mappings() {
+    if (host_unregister) {
+        for (void * addr : registered_mappings) {
+            host_unregister(addr);
+        }
+    }
+    registered_mappings.clear();
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1356,8 +1375,25 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
             const double t_ms = (ggml_time_us() - t_start_us)/1000.0;
             const double sz_mib = mapping->size()/1024.0/1024.0;
-            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (prefetch/populate %s) took %.2f ms (%.1f MiB/s)\n",
-                    __func__, sz_mib, prefetch ? "on" : "off", t_ms, t_ms > 0.0 ? sz_mib/(t_ms/1000.0) : 0.0);
+            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead %s) took %.2f ms\n",
+                    __func__, sz_mib, prefetch ? "on" : "off", t_ms);
+
+            // pin the mapping for DMA uploads if a device backend provided a register fn
+            if (host_register) {
+                const int64_t t_reg_us = ggml_time_us();
+                if (host_register(mapping->addr(), mapping->size())) {
+                    registered_mappings.push_back(mapping->addr());
+                    LLAMA_LOG_INFO("%s: timing: host-registered (pinned) %.2f MiB mapping in %.2f ms\n",
+                            __func__, sz_mib, (ggml_time_us() - t_reg_us)/1000.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to host-register %.2f MiB mapping - falling back to streamed tensor loading\n",
+                            __func__, sz_mib);
+                    unregister_mappings();
+                    host_register = nullptr;
+                    use_mmap      = false;
+                }
+            }
+
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1365,6 +1401,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+
+            if (!use_mmap) {
+                // host registration failed - remaining files will be streamed
+                break;
+            }
         }
     }
 
@@ -1530,7 +1571,9 @@ bool llama_model_loader::load_all_data(
     }
 
     if (use_mmap) {
-        LLAMA_LOG_INFO("%s: timing: upload strategy: mmap (zero-copy for host buffers, synchronous pageable copies for device buffers)\n", __func__);
+        LLAMA_LOG_INFO("%s: timing: upload strategy: mmap (%s)\n", __func__,
+                !registered_mappings.empty() ? "host-registered: device uploads are DMA from the pinned mapping"
+                                             : "zero-copy for host buffers, synchronous pageable copies for device buffers");
     } else if (upload_backend) {
         LLAMA_LOG_INFO("%s: timing: upload strategy: async uploads via %zu x %.1f MiB pinned staging buffers (direct I/O: %s)\n",
                 __func__, n_buffers, buffer_size/1024.0/1024.0, alignment != 1 ? "yes" : "no");
@@ -1686,12 +1729,16 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
-        // unmap offloaded tensors and metadata
+        // unmap offloaded tensors; keep the metadata region of the main file mapped
+        // for the lifetime of the model (metadata/vocab string views point into it)
         if (use_mmap) {
+            // unpin before unmapping anything
+            unregister_mappings();
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
-                mapping->unmap_fragment(0, mmap_used.first);
+                const size_t keep = idx == 0 ? std::min(meta_keep, mapping->size()) : 0;
+                mapping->unmap_fragment(keep, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }

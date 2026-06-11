@@ -1475,17 +1475,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // mmap only helps when the mapped pages are used by the backend buffers directly, i.e. for
-    // weights that stay in host memory (CPU buffer types) or on devices that can use host
-    // pointers in place (e.g. Metal with unified memory). Weights headed to any other device
-    // (e.g. CUDA) would be copied out of the mapping with synchronous, pageable host-to-device
-    // transfers, which is much slower than streaming the file through pinned staging buffers.
-    // If any weight bytes are headed to such a device, disable mmap and use the async upload
-    // path instead. Reads stay buffered, so the page cache still accelerates reloading a
-    // recently used model.
+    // mmap pages can only be used by the backend buffers directly for weights that stay in
+    // host memory (CPU buffer types) or on devices that can use host pointers in place
+    // (e.g. Metal with unified memory). Weights headed to any other device (e.g. CUDA) would
+    // be copied out of the mapping with synchronous, pageable host-to-device transfers.
+    // For those, pin the mapping via the device backend (cudaHostRegister) so the uploads
+    // run as real DMA. If the backend cannot register host memory, fall back to disabling
+    // mmap and streaming the file through the async pinned staging path instead.
     if (ml.use_mmap && use_mmap_buffer && !ml.no_alloc && !ml.files.empty()) {
         size_t n_bytes_total  = 0;
         size_t n_bytes_device = 0;
+        ggml_backend_dev_t dev_bound = nullptr; // first device needing copies out of the mapping
         for (auto & [buft, ctx_ptr] : ml.ctx_map) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (!dev) {
@@ -1505,15 +1505,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 n_bytes_total += ggml_nbytes(t);
                 if (!mmap_eligible) {
                     n_bytes_device += ggml_nbytes(t);
+                    if (!dev_bound && dev != cpu_dev) {
+                        dev_bound = dev;
+                    }
                 }
             }
         }
 
         if (n_bytes_device > 0) {
-            LLAMA_LOG_INFO("%s: %.1f%% of the model bytes go to device buffers that cannot use mmap directly - "
-                    "disabling mmap and streaming the tensor data instead\n",
-                    __func__, 100.0*n_bytes_device/n_bytes_total);
-            ml.use_mmap = false;
+            ggml_backend_reg_t reg = dev_bound ? ggml_backend_dev_backend_reg(dev_bound) : nullptr;
+            auto reg_fn   = reg ? (llama_model_loader::host_buffer_register_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer")   : nullptr;
+            auto unreg_fn = reg ? (llama_model_loader::host_buffer_unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+            if (reg_fn && unreg_fn) {
+                ml.host_register   = reg_fn;
+                ml.host_unregister = unreg_fn;
+                LLAMA_LOG_INFO("%s: %.1f%% of the model bytes are device-bound - pinning the mapping for DMA uploads\n",
+                        __func__, 100.0*n_bytes_device/n_bytes_total);
+            } else {
+                LLAMA_LOG_INFO("%s: %.1f%% of the model bytes are device-bound and %s does not support host registration - "
+                        "disabling mmap and streaming the tensor data instead\n",
+                        __func__, 100.0*n_bytes_device/n_bytes_total,
+                        dev_bound ? ggml_backend_dev_name(dev_bound) : "the device");
+                ml.use_mmap = false;
+            }
         }
     }
 
