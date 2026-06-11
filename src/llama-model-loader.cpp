@@ -17,6 +17,16 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static bool llama_cpu_is_numa() {
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) {
+        return false;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
+    return is_numa_fn ? is_numa_fn() : false;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -538,24 +548,13 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     if (!fname.empty()) {
-        // Load the main GGUF
-        struct ggml_context * ctx = NULL;
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ &ctx,
-        };
-
-        metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
-        metadata = metadata_ptr.get();
-        if (metadata == nullptr) {
-            throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+        // open the file and resolve the mmap/direct-io conflict before parsing, so that
+        // the metadata can be parsed straight out of a fresh mapping (zero string copies)
+        if (!llama_mmap::SUPPORTED) {
+            use_mmap = false;
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
-
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
-        contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
             if (files.back()->has_direct_io()) {
@@ -570,6 +569,36 @@ llama_model_loader::llama_model_loader(
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
             }
         }
+
+        // Load the main GGUF
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+
+        if (use_mmap) {
+            // map the file now (init_mappings will reuse this mapping) and parse the
+            // metadata from it - string values become views into the mapping instead
+            // of ~2 freads and an owned copy per string
+            const int64_t t_mmap_us = ggml_time_us();
+            mappings.emplace_back(std::make_unique<llama_mmap>(files.back().get(), /*prefetch =*/ -1, llama_cpu_is_numa()));
+            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead on) took %.2f ms\n",
+                    __func__, mappings.back()->size()/1024.0/1024.0, (ggml_time_us() - t_mmap_us)/1000.0);
+
+            metadata_ptr.reset(gguf_init_from_buffer_borrow(mappings.back()->addr(), mappings.back()->size(), params));
+        } else {
+            metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+        }
+        metadata = metadata_ptr.get();
+        if (metadata == nullptr) {
+            throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+        }
+
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -619,7 +648,18 @@ llama_model_loader::llama_model_loader(
                     /*.no_alloc = */ true,
                     /*.ctx      = */ &ctx,
                 };
-                gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
+
+                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+
+                gguf_context_ptr ctx_gguf;
+                if (use_mmap) {
+                    // keep mappings index-aligned with files; parse the split metadata
+                    // from its mapping like the main file
+                    mappings.emplace_back(std::make_unique<llama_mmap>(files.back().get(), /*prefetch =*/ -1, llama_cpu_is_numa()));
+                    ctx_gguf.reset(gguf_init_from_buffer_borrow(mappings.back()->addr(), mappings.back()->size(), split_params));
+                } else {
+                    ctx_gguf.reset(gguf_init_from_file(fname_split, split_params));
+                }
                 if (!ctx_gguf) {
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
                 }
@@ -636,7 +676,6 @@ llama_model_loader::llama_model_loader(
                     }
                 }
 
-                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -790,7 +829,8 @@ llama_model_loader::llama_model_loader(
                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
                 : gguf_type_name(type);
 
-            std::string value          = gguf_kv_to_str(metadata, i);
+            // the value is only previewed (40 chars) - do not stringify huge arrays
+            std::string value          = gguf_kv_to_str(metadata, i, /*max_arr_items =*/ 4);
             const size_t MAX_VALUE_LEN = 40;
             if (value.size() > MAX_VALUE_LEN) {
                 value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
@@ -1359,24 +1399,18 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
-            bool is_numa = false;
-
-            auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (dev) {
-                auto * reg = ggml_backend_dev_backend_reg(dev);
-                auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
-                if (is_numa_fn) {
-                    is_numa = is_numa_fn();
-                }
+        for (size_t idx = 0; idx < files.size(); idx++) {
+            if (idx >= mappings.size()) {
+                // not mapped during metadata parsing (e.g. FILE* based loads) - map now
+                const int64_t t_start_us = ggml_time_us();
+                mappings.emplace_back(std::make_unique<llama_mmap>(files[idx].get(), prefetch ? -1 : 0, llama_cpu_is_numa()));
+                LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead %s) took %.2f ms\n",
+                        __func__, mappings.back()->size()/1024.0/1024.0, prefetch ? "on" : "off",
+                        (ggml_time_us() - t_start_us)/1000.0);
             }
 
-            const int64_t t_start_us = ggml_time_us();
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
-            const double t_ms = (ggml_time_us() - t_start_us)/1000.0;
-            const double sz_mib = mapping->size()/1024.0/1024.0;
-            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead %s) took %.2f ms\n",
-                    __func__, sz_mib, prefetch ? "on" : "off", t_ms);
+            const auto & mapping = mappings[idx];
+            const double sz_mib  = mapping->size()/1024.0/1024.0;
 
             // pin the mapping for DMA uploads if a device backend provided a register fn
             if (host_register) {
@@ -1400,7 +1434,6 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmap->init(mapping->addr());
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
-            mappings.emplace_back(std::move(mapping));
 
             if (!use_mmap) {
                 // host registration failed - remaining files will be streamed
