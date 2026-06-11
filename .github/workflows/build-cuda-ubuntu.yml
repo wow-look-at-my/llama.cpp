@@ -3,26 +3,6 @@ name: CI (CUDA, ubuntu)
 on:
   workflow_dispatch: # allows manual triggering
   push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-cuda-ubuntu.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-cuda-ubuntu.yml',
-      'ggml/src/ggml-cuda/**'
-    ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -51,13 +31,6 @@ jobs:
         run: |
           apt update
           apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: cuda-ubuntu-24.04-cuda
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Build with CMake
         # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
