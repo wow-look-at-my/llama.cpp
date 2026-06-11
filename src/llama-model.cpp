@@ -1199,7 +1199,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 void llama_model_base::load_vocab(llama_model_loader & ml) {
     const auto kv = LLM_KV(arch);
 
-    vocab.load(ml, kv);
+    // in vocab-only mode the loader's mapping is destroyed with the loader, so the
+    // vocab must own its token text storage instead of borrowing the mapping
+    vocab.load(ml, kv, /*can_borrow =*/ !hparams.vocab_only);
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {

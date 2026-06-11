@@ -587,6 +587,7 @@ llama_model_loader::llama_model_loader(
                     __func__, mappings.back()->size()/1024.0/1024.0, (ggml_time_us() - t_mmap_us)/1000.0);
 
             metadata_ptr.reset(gguf_init_from_buffer_borrow(mappings.back()->addr(), mappings.back()->size(), params));
+            meta_borrowed = metadata_ptr != nullptr;
         } else {
             metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
         }

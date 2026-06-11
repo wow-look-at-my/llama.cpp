@@ -489,7 +489,9 @@ static bool llama_mtp_vocab_matches(const llama_model & tgt, const llama_model &
     constexpr int32_t k_check_from = 5; // align with speculative MTP vocab check
     for (uint32_t i = (uint32_t) k_check_from; i < vt.n_tokens(); ++i) {
         const llama_token id = (llama_token) i;
-        if (std::strcmp(vt.token_get_text(id), va.token_get_text(id)) != 0) {
+        // compare the text views directly - token_get_text() would materialize the
+        // NUL-terminated shadow table of both vocabs just for this check
+        if (vt.get_token_data(id).text != va.get_token_data(id).text) {
             LLAMA_LOG_ERROR("%s: vocab text mismatch at token id %d\n", __func__, (int) id);
             return false;
         }

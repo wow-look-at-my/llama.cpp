@@ -118,6 +118,10 @@ struct llama_model_loader {
     // mapped for the lifetime of the model - metadata/vocab string views point there
     size_t meta_keep = 0;
 
+    // true when the metadata was parsed zero-copy out of the mapping (string values
+    // in `metadata` are views into mappings[0], which the model retains)
+    bool meta_borrowed = false;
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
