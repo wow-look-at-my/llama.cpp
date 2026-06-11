@@ -2263,7 +2263,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
-        string_format("whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),
+        string_format("whether to allow memory-mapping the model. mmap is only used when weights can be used directly from the mapping (e.g. CPU or unified memory); weights bound to other devices are streamed through pinned buffers instead (default: %s)", params.use_mmap ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.use_mmap = value;
         }

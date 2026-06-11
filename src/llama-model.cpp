@@ -1475,6 +1475,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // mmap only helps when the mapped pages are used by the backend buffers directly, i.e. for
+    // weights that stay in host memory (CPU buffer types) or on devices that can use host
+    // pointers in place (e.g. Metal with unified memory). Weights headed to any other device
+    // (e.g. CUDA) would be copied out of the mapping with synchronous, pageable host-to-device
+    // transfers, which is much slower than streaming the file through pinned staging buffers.
+    // If any weight bytes are headed to such a device, disable mmap and use the async upload
+    // path instead. Reads stay buffered, so the page cache still accelerates reloading a
+    // recently used model.
+    if (ml.use_mmap && use_mmap_buffer && !ml.no_alloc && !ml.files.empty()) {
+        size_t n_bytes_total  = 0;
+        size_t n_bytes_device = 0;
+        for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (!dev) {
+                dev = cpu_dev;
+            }
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+
+            // matches the buffer_from_host_ptr check during buffer creation below
+            const bool mmap_eligible = ggml_backend_buft_is_host(buft) ||
+                (props.caps.buffer_from_host_ptr && buft == ggml_backend_dev_buffer_type(dev));
+
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t != nullptr; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+                if (ml.get_weight(ggml_get_name(t)) == nullptr) {
+                    continue; // no data for this tensor in the model file
+                }
+                n_bytes_total += ggml_nbytes(t);
+                if (!mmap_eligible) {
+                    n_bytes_device += ggml_nbytes(t);
+                }
+            }
+        }
+
+        if (n_bytes_device > 0) {
+            LLAMA_LOG_INFO("%s: %.1f%% of the model bytes go to device buffers that cannot use mmap directly - "
+                    "disabling mmap and streaming the tensor data instead\n",
+                    __func__, 100.0*n_bytes_device/n_bytes_total);
+            ml.use_mmap = false;
+        }
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
