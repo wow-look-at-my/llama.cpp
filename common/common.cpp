@@ -1424,6 +1424,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (params.warmup) {
         LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
+        const int64_t t_warmup_us = ggml_time_us();
+
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
         llama_token eos = llama_vocab_eos(vocab);
@@ -1454,6 +1456,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+
+        LOG_INF("%s: timing: warmup run took %.2f ms\n", __func__, (ggml_time_us() - t_warmup_us)/1000.0);
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();

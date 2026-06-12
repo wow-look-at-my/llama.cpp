@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <string_view>
 
 // pre-tokenization types
 enum llama_vocab_pre_type {
@@ -71,7 +72,10 @@ struct llama_model_loader;
 
 struct llama_vocab {
     struct token_data {
-        std::string      text;
+        // view into the retained model mapping (or a vocab-owned arena when the
+        // mapping cannot be borrowed); NOT NUL-terminated - use token_get_text()
+        // for a lazily materialized C string
+        std::string_view text;
         float            score;
         llama_token_attr attr;
     };
@@ -79,7 +83,9 @@ struct llama_vocab {
     llama_vocab();
     ~llama_vocab();
 
-    void load(llama_model_loader & ml, const LLM_KV & kv);
+    // can_borrow: token texts may stay views into the loader's mapping (which the
+    // model retains); pass false when the mapping will not outlive the vocab
+    void load(llama_model_loader & ml, const LLM_KV & kv, bool can_borrow = true);
 
     std::string get_tokenizer_model() const;
     std::string get_tokenizer_pre() const;

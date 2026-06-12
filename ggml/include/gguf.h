@@ -207,4 +207,18 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+
+// C++-only zero-copy extensions (fork): parse a GGUF from a caller-owned,
+// STABLE buffer (e.g. a retained mmap of the model file). String payloads are
+// borrowed as views into the buffer instead of copied - the buffer must
+// outlive the returned context. The regular const char * string getters keep
+// working on such a context by lazily materializing NUL-terminated copies on
+// access (cold paths only - hot paths should use the _view accessors).
+#include <string_view>
+
+GGML_API struct gguf_context * gguf_init_from_buffer_borrow(const void * data, size_t size, struct gguf_init_params params);
+
+// length-aware string accessors; valid for both owned and borrowed contexts
+GGML_API std::string_view gguf_get_val_str_view(const struct gguf_context * ctx, int64_t key_id);
+GGML_API std::string_view gguf_get_arr_str_view(const struct gguf_context * ctx, int64_t key_id, size_t i);
 #endif
