@@ -83,6 +83,19 @@ sync if you change tensor names or KV keys here.
 llama-server -m gemma4-target.gguf --spec-type gemma4-mtp --mtp-head gemma4-assistant.gguf
 ```
 
+## Model load path (fork changes)
+
+The loader is tuned for GPU-only serving: no `MAP_POPULATE` (readahead via
+`madvise(WILLNEED)` instead), GGUF metadata parsed zero-copy out of the
+mapping (`gguf_init_from_buffer_borrow`; string values are `string_view`s),
+vocab token texts and BPE merges are views into the retained mapping (the
+metadata region of the main file stays mapped for the model's lifetime), and
+device-bound weights are uploaded by DMA from the `cudaHostRegister`-pinned
+mapping, falling back to the async pinned-staging streamer when registration
+is unavailable. Every load phase logs a `timing:` line (grep the server log)
+- see TODO.md for the deferred follow-ups (on-disk NUL-terminated strings,
+flat tokenizer trie).
+
 ## Key files
 
 - `src/llama-arch.{h,cpp}` — `LLM_ARCH_GEMMA4_ASSISTANT`, `mtp.*` tensor names, `LLM_KV_GEMMA4_ASSISTANT_*`

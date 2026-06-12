@@ -82,7 +82,8 @@ std::string format(const char * fmt, ...);
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+// max_arr_items >= 0 limits how many array elements are stringified (preview)
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, int max_arr_items = -1);
 
 #define LLAMA_TENSOR_NAME_FATTN   "__fattn__"
 #define LLAMA_TENSOR_NAME_FGDN_AR "__fgdn_ar__"

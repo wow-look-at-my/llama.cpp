@@ -34,13 +34,13 @@ jobs:
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_SERVER=OFF \
-            -DLLAMA_BUILD_TOOLS=OFF
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON
+
+      - name: Build (full CPU tree)
+        run: cmake --build build -j$(nproc)
 
       # CPU-side regression test for the Gemma 4 MTP graph-context use-after-free.
-      # Builds and runs only this self-contained test (no model weights, no GPU).
-      - name: Build MTP graph-lifetime test
-        run: cmake --build build --target test-mtp-graph-lifetime -j$(nproc)
-
+      # Runs only this self-contained test (no model weights, no GPU).
       - name: Run MTP graph-lifetime test
         run: ctest --test-dir build -R '^test-mtp-graph-lifetime$' --output-on-failure
