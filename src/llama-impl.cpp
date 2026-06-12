@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include <sstream>
 
 struct llama_logger_state {
@@ -133,7 +134,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int 
     }
 }
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, int max_arr_items) {
     const enum gguf_type type = gguf_get_kv_type(ctx_gguf, i);
 
     switch (type) {
@@ -143,10 +144,13 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             {
                 const enum gguf_type arr_type = gguf_get_arr_type(ctx_gguf, i);
                 int arr_n = gguf_get_arr_n(ctx_gguf, i);
+                // avoid materializing huge arrays (e.g. the ~262k-entry token list)
+                // when the caller only needs a preview
+                const int arr_show = max_arr_items >= 0 ? std::min(arr_n, max_arr_items) : arr_n;
                 const void * data = arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx_gguf, i);
                 std::stringstream ss;
                 ss << "[";
-                for (int j = 0; j < arr_n; j++) {
+                for (int j = 0; j < arr_show; j++) {
                     if (arr_type == GGUF_TYPE_STRING) {
                         std::string val = gguf_get_arr_str(ctx_gguf, i, j);
                         // escape quotes
@@ -161,6 +165,9 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
                     if (j < arr_n - 1) {
                         ss << ", ";
                     }
+                }
+                if (arr_show < arr_n) {
+                    ss << "... (" << arr_n << " items)";
                 }
                 ss << "]";
                 return ss.str();

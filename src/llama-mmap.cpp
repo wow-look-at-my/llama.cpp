@@ -452,7 +452,10 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        // note: deliberately no MAP_POPULATE - it makes mmap() synchronously read the
+        // entire file into the page cache (single-threaded, page-by-page) before
+        // returning. the POSIX_MADV_WILLNEED below kicks off the same warming as
+        // background readahead instead, so the load can proceed while I/O is in flight.
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
