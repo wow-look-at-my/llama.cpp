@@ -1,0 +1,36 @@
+# One-off: is the docker DAEMON reachable from inside the runner? If yes, we can
+# use container: (fast, prebuilt CUDA image). If no, container: jobs fail at the
+# runner's init preflight and we must build bare-metal. Delete after.
+name: runner-probe
+on:
+  push:
+    paths:
+      - .github/workflows/runner-probe.yml
+  workflow_dispatch:
+concurrency:
+  group: mmq-bench
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: [self-hosted, gpu, nvidia]
+    steps:
+      - name: docker reachability
+        run: |
+          set +e
+          echo "== docker socket present? =="
+          ls -l /var/run/docker.sock 2>&1
+          echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+          echo "== docker CLI =="; command -v docker
+          echo "== docker version (CLI + SERVER) =="
+          docker version 2>&1 | head -30
+          echo "exit=$?"
+          echo "== docker info (daemon) =="
+          docker info --format '{{.ServerVersion}} runtimes={{range $k,$v := .Runtimes}}{{$k}} {{end}}' 2>&1 | head -5
+          echo "== docker ps =="
+          docker ps 2>&1 | head -5
+          echo "== nvidia runtime available? =="
+          docker info 2>/dev/null | grep -i -A2 'runtimes' | head -5
+          echo "== can we pull+run a CUDA image with --gpus all? =="
+          timeout 180 docker run --rm --gpus all nvidia/cuda:12.9.0-base-ubuntu24.04 nvidia-smi -L 2>&1 | head -10
+          echo "run_exit=$?"
+          true
