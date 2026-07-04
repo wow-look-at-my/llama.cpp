@@ -31,9 +31,6 @@ on:
       flash_attn:
         description: "llama-bench -fa (0/1)"
         default: "1"
-  push:
-    paths:
-      - .github/workflows/mmq-vs-cublas-bench.yml
 
 concurrency:
   group: mmq-bench

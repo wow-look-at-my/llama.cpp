@@ -3,9 +3,6 @@
 # runner's init preflight and we must build bare-metal. Delete after.
 name: runner-probe
 on:
-  push:
-    paths:
-      - .github/workflows/runner-probe.yml
   workflow_dispatch:
 concurrency:
   group: mmq-bench
