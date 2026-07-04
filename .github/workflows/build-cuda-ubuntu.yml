@@ -38,6 +38,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES=89-real \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
@@ -45,3 +46,16 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_CUDA_CUB_3DOT2=ON
           cmake --build build
+
+      # CPU-side regression test for the Gemma 4 MTP graph-context use-after-free
+      # (tests/test-mtp-graph-lifetime.cpp): no GPU, no model weights, no graph
+      # compute -- it runs fine on this GPU-less runner. The binary does link the
+      # CUDA backend, which carries a DT_NEEDED on libcuda.so.1 (the driver, pulled
+      # in by CUDA::cuda_driver for VMM); no driver exists here, so satisfy the
+      # loader with the CUDA toolkit's stub. ggml_cuda_init then simply reports
+      # 0 CUDA devices and the test runs on CPU.
+      - name: Run MTP graph-lifetime test
+        run: |
+          ln -sfn libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}"
+          ctest --test-dir build -R '^test-mtp-graph-lifetime$' --output-on-failure
