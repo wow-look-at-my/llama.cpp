@@ -36,8 +36,13 @@ on:
   push:
 
 concurrency:
-  group: mmq-bench
-  cancel-in-progress: false
+  # Per-ref group: branches never cancel each other, and a feature-branch run can
+  # never cancel a default-branch run. Cancellation is always triggered by the
+  # newer run, so an earlier run never cancels a later one. Cancel superseded
+  # in-progress runs on feature branches (latest commit wins, no A6000 backlog),
+  # but never on the default branch -- every master commit gets a full run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch }}
 
 jobs:
   bench:
