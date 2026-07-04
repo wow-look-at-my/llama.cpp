@@ -21,8 +21,8 @@ static int32_t gemma4_mtp_kv_layer_last_in_range(
     if (range_start < 0) {
         range_start = 0;
     }
-    if (range_end > (int32_t) tgt.n_layer) {
-        range_end = (int32_t) tgt.n_layer;
+    if (range_end > (int32_t) tgt.n_layer()) {
+        range_end = (int32_t) tgt.n_layer();
     }
     for (int32_t il = range_start; il < range_end; ++il) {
         if (tgt.is_swa((uint32_t) il) == want_swa) {
@@ -117,7 +117,7 @@ static void gemma4_mtp_build_one_step(
 
         const bool read_swa = hparams.is_swa(il);
 
-        const int32_t n_tgt = (int32_t) target.hparams.n_layer;
+        const int32_t n_tgt = (int32_t) target.hparams.n_layer();
 
         // Per HF Gemma4AssistantForCausalLM: MTP cross-attention reads ONE shared KV per
         // attention type from the target — the LAST layer of that type.
@@ -258,7 +258,8 @@ llama_model_gemma4::graph_mtp::graph_mtp(
         const llama_model & target_,
         const llama_model & mtp_,
         const llm_graph_params & params) :
-        llm_graph_context(params),
+        graph_mtp_params_owner(params),
+        llm_graph_context(params_owned),
         target(target_),
         mtp(mtp_) {
     const int64_t n_bb = mtp.hparams.n_embd_backbone;
@@ -305,12 +306,12 @@ llama_model_gemma4::graph_mtp::graph_mtp(
 
 void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
 
     uint32_t n_kv_shared_layers = 0;
     ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
 
-    hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t) n_kv_shared_layers;
+    hparams.n_layer_kv_from_start = hparams.n_layer_all - (int32_t) n_kv_shared_layers;
     hparams.f_attention_scale     = 1.0f;
 
     ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);

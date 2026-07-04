@@ -9,10 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #define GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
@@ -137,6 +140,36 @@ struct gguf_kv {
     std::vector<int8_t>      data;
     std::vector<std::string> data_string;
 
+    // when parsed from a stable caller-owned buffer (gguf_init_from_buffer_borrow),
+    // string payloads are views into that buffer instead of owned copies
+    std::vector<std::pair<const char *, size_t>> data_string_borrowed;
+    // lazily materialized NUL-terminated copies for the const char * C API when
+    // borrowing; deque for stable addresses
+    mutable std::deque<std::string> data_string_shadow;
+
+    bool borrowed() const {
+        return !data_string_borrowed.empty();
+    }
+
+    size_t n_str() const {
+        return borrowed() ? data_string_borrowed.size() : data_string.size();
+    }
+
+    std::string_view get_str_view(const size_t i = 0) const {
+        GGML_ASSERT(type == GGUF_TYPE_STRING);
+        if (borrowed()) {
+            GGML_ASSERT(data_string_borrowed.size() >= i+1);
+            return std::string_view(data_string_borrowed[i].first, data_string_borrowed[i].second);
+        }
+        GGML_ASSERT(data_string.size() >= i+1);
+        return std::string_view(data_string[i]);
+    }
+
+    gguf_kv(const std::string & key, std::vector<std::pair<const char *, size_t>> && views, bool is_array)
+            : key(key), is_array(is_array), type(GGUF_TYPE_STRING), data_string_borrowed(std::move(views)) {
+        GGML_ASSERT(!key.empty());
+    }
+
     template <typename T>
     gguf_kv(const std::string & key, const T value)
             : key(key), is_array(false), type(type_to_gguf_type<T>::value) {
@@ -178,7 +211,7 @@ struct gguf_kv {
 
     size_t get_ne() const {
         if (type == GGUF_TYPE_STRING) {
-            const size_t ne = data_string.size();
+            const size_t ne = n_str();
             GGML_ASSERT(is_array || ne == 1);
             return ne;
         }
@@ -193,6 +226,13 @@ struct gguf_kv {
     const T & get_val(const size_t i = 0) const {
         GGML_ASSERT(type_to_gguf_type<T>::value == type);
         if constexpr (std::is_same<T, std::string>::value) {
+            if (borrowed()) {
+                // the C API and writer paths need an owned, NUL-terminated string -
+                // materialize a copy on access (cold paths; hot paths use get_str_view)
+                GGML_ASSERT(data_string_borrowed.size() >= i+1);
+                data_string_shadow.emplace_back(data_string_borrowed[i].first, data_string_borrowed[i].second);
+                return data_string_shadow.back();
+            }
             GGML_ASSERT(data_string.size() >= i+1);
             return data_string[i];
         }
@@ -228,13 +268,19 @@ struct gguf_context {
 };
 
 struct gguf_reader {
+    // base address when reading from a stable in-memory buffer; enables borrowing
+    // string payloads as views instead of copying them
+    const uint8_t * borrow_base = nullptr;
+
     gguf_reader(
             gguf_reader_callback_t callback,
             void * userdata,
             size_t max_chunk_read,
             uint64_t data_offset = 0,
-            uint64_t nbytes_remain = 0)
-        : callback(callback),
+            uint64_t nbytes_remain = 0,
+            const uint8_t * borrow_base = nullptr)
+        : borrow_base(borrow_base),
+          callback(callback),
           userdata(userdata),
           max_chunk_read(max_chunk_read),
           data_offset(data_offset),
@@ -354,6 +400,25 @@ struct gguf_reader {
         return read_raw(dst.data(), static_cast<size_t>(size)) == size;
     }
 
+    // read a string payload as a view into borrow_base, without copying
+    bool read_borrowed_str(std::pair<const char *, size_t> & dst) const {
+        GGML_ASSERT(borrow_base != nullptr);
+        uint64_t size = 0;
+        if (!read(size)) {
+            return false;
+        }
+        if (size > GGUF_MAX_STRING_LENGTH) {
+            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds maximum %" PRIu64 "\n", __func__, size, (uint64_t) GGUF_MAX_STRING_LENGTH);
+            return false;
+        }
+        if (size > nbytes_remain) {
+            GGML_LOG_ERROR("%s: string length %" PRIu64 " exceeds remaining buffer size %" PRIu64 " bytes\n", __func__, size, nbytes_remain);
+            return false;
+        }
+        dst = { reinterpret_cast<const char *>(borrow_base) + data_offset, static_cast<size_t>(size) };
+        return seek(data_offset + size);
+    }
+
     bool read(void * dst, const size_t size) const {
         if (size > nbytes_remain) {
             return false;
@@ -445,6 +510,24 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
         }
         kv.emplace_back(key, value);
     }
+    return true;
+}
+
+// borrow string payloads as views into the reader's stable buffer instead of copying
+static bool gguf_read_emplace_borrowed_str(const struct gguf_reader & gr, std::vector<struct gguf_kv> & kv, const std::string & key, const bool is_array, const size_t n) {
+    if (n > GGUF_MAX_ARRAY_ELEMENTS || n > SIZE_MAX/sizeof(uint64_t)) {
+        return false;
+    }
+    std::vector<std::pair<const char *, size_t>> views;
+    views.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        std::pair<const char *, size_t> view;
+        if (!gr.read_borrowed_str(view)) {
+            return false;
+        }
+        views.push_back(view);
+    }
+    kv.emplace_back(key, std::move(views), is_array);
     return true;
 }
 
@@ -586,7 +669,9 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 case GGUF_TYPE_INT32:   ok = ok && gguf_read_emplace_helper<int32_t>    (gr, ctx->kv, key, is_array, n); break;
                 case GGUF_TYPE_FLOAT32: ok = ok && gguf_read_emplace_helper<float>      (gr, ctx->kv, key, is_array, n); break;
                 case GGUF_TYPE_BOOL:    ok = ok && gguf_read_emplace_helper<bool>       (gr, ctx->kv, key, is_array, n); break;
-                case GGUF_TYPE_STRING:  ok = ok && gguf_read_emplace_helper<std::string>(gr, ctx->kv, key, is_array, n); break;
+                case GGUF_TYPE_STRING:  ok = ok && (gr.borrow_base != nullptr ?
+                                                    gguf_read_emplace_borrowed_str          (gr, ctx->kv, key, is_array, n) :
+                                                    gguf_read_emplace_helper<std::string>   (gr, ctx->kv, key, is_array, n)); break;
                 case GGUF_TYPE_UINT64:  ok = ok && gguf_read_emplace_helper<uint64_t>   (gr, ctx->kv, key, is_array, n); break;
                 case GGUF_TYPE_INT64:   ok = ok && gguf_read_emplace_helper<int64_t>    (gr, ctx->kv, key, is_array, n); break;
                 case GGUF_TYPE_FLOAT64: ok = ok && gguf_read_emplace_helper<double>     (gr, ctx->kv, key, is_array, n); break;
@@ -976,6 +1061,31 @@ struct gguf_context * gguf_init_from_buffer(const void * data, size_t size, stru
     return gguf_init_from_reader(gr, params);
 }
 
+struct gguf_context * gguf_init_from_buffer_borrow(const void * data, size_t size, struct gguf_init_params params) {
+    if (data == nullptr || size == 0) {
+        return nullptr;
+    }
+
+    gguf_buffer_reader reader = {
+        /*.data = */ static_cast<const uint8_t *>(data),
+        /*.size = */ size,
+    };
+    const struct gguf_reader gr(gguf_buffer_reader_callback, &reader, SIZE_MAX, 0, size, static_cast<const uint8_t *>(data));
+    return gguf_init_from_reader(gr, params);
+}
+
+std::string_view gguf_get_val_str_view(const struct gguf_context * ctx, int64_t key_id) {
+    GGML_ASSERT(key_id >= 0 && key_id < gguf_get_n_kv(ctx));
+    GGML_ASSERT(ctx->kv[key_id].get_ne() == 1);
+    return ctx->kv[key_id].get_str_view(0);
+}
+
+std::string_view gguf_get_arr_str_view(const struct gguf_context * ctx, int64_t key_id, size_t i) {
+    GGML_ASSERT(key_id >= 0 && key_id < gguf_get_n_kv(ctx));
+    GGML_ASSERT(ctx->kv[key_id].get_type() == GGUF_TYPE_STRING);
+    return ctx->kv[key_id].get_str_view(i);
+}
+
 struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
     FILE * file = ggml_fopen(fname, "rb");
 
@@ -1058,14 +1168,14 @@ const void * gguf_get_arr_data(const struct gguf_context * ctx, int64_t key_id) 
 const char * gguf_get_arr_str(const struct gguf_context * ctx, int64_t key_id, size_t i) {
     GGML_ASSERT(key_id >= 0 && key_id < gguf_get_n_kv(ctx));
     GGML_ASSERT(ctx->kv[key_id].get_type() == GGUF_TYPE_STRING);
-    return ctx->kv[key_id].data_string[i].c_str();
+    return ctx->kv[key_id].get_val<std::string>(i).c_str();
 }
 
 size_t gguf_get_arr_n(const struct gguf_context * ctx, int64_t key_id) {
     GGML_ASSERT(key_id >= 0 && key_id < gguf_get_n_kv(ctx));
 
     if (ctx->kv[key_id].type == GGUF_TYPE_STRING) {
-        return ctx->kv[key_id].data_string.size();
+        return ctx->kv[key_id].n_str();
     }
 
     const size_t type_size = gguf_type_size(ctx->kv[key_id].type);

@@ -801,7 +801,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    size_t size = ggml_nbytes(tensor);
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
     if (ggml_is_quantized(tensor->type)) {
@@ -812,8 +816,6 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
 
     return size;
-
-    GGML_UNUSED(buft);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
@@ -4832,10 +4834,6 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
-        return false;
-    }
-
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
     if (err != cudaSuccess) {
@@ -4855,10 +4853,6 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
-        return;
-    }
-
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error

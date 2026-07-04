@@ -17,6 +17,16 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static bool llama_cpu_is_numa() {
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) {
+        return false;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
+    return is_numa_fn ? is_numa_fn() : false;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -146,7 +156,7 @@ namespace GGUFMeta {
             const enum gguf_type arr_type = gguf_get_arr_type(ctx, k);
             return ArrayInfo {
                 arr_type,
-                size_t(gguf_get_arr_n(ctx, k)),
+                gguf_get_arr_n(ctx, k),
                 arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx, k),
             };
         }
@@ -393,6 +403,7 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -445,7 +456,7 @@ namespace GGUFMeta {
         }
 
         if (n > N_MAX) {
-            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", (uint32_t) n, (uint32_t) N_MAX, key.c_str()));
+            throw std::runtime_error(format("n > N_MAX: %u > %u for key %s", n, (uint32_t) N_MAX, key.c_str()));
         }
 
         if (gguf_get_kv_type(metadata, kid) == GGUF_TYPE_ARRAY) {
@@ -502,9 +513,9 @@ namespace GGUFMeta {
     }
 
     // TODO: this is not very clever - figure out something better
-    template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<int,      4>>  (enum llm_kv kid, std::array<int,      4>   & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
 llama_model_loader::llama_model_loader(
@@ -521,6 +532,8 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    const int64_t t_start_us = ggml_time_us();
+
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -535,24 +548,13 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     if (!fname.empty()) {
-        // Load the main GGUF
-        struct ggml_context * ctx = NULL;
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ &ctx,
-        };
-
-        metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
-        metadata = metadata_ptr.get();
-        if (metadata == nullptr) {
-            throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+        // open the file and resolve the mmap/direct-io conflict before parsing, so that
+        // the metadata can be parsed straight out of a fresh mapping (zero string copies)
+        if (!llama_mmap::SUPPORTED) {
+            use_mmap = false;
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
-
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
-        contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
             if (files.back()->has_direct_io()) {
@@ -567,6 +569,37 @@ llama_model_loader::llama_model_loader(
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
             }
         }
+
+        // Load the main GGUF
+        struct ggml_context * ctx = NULL;
+        struct gguf_init_params params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+
+        if (use_mmap) {
+            // map the file now (init_mappings will reuse this mapping) and parse the
+            // metadata from it - string values become views into the mapping instead
+            // of ~2 freads and an owned copy per string
+            const int64_t t_mmap_us = ggml_time_us();
+            mappings.emplace_back(std::make_unique<llama_mmap>(files.back().get(), /*prefetch =*/ -1, llama_cpu_is_numa()));
+            LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead on) took %.2f ms\n",
+                    __func__, mappings.back()->size()/1024.0/1024.0, (ggml_time_us() - t_mmap_us)/1000.0);
+
+            metadata_ptr.reset(gguf_init_from_buffer_borrow(mappings.back()->addr(), mappings.back()->size(), params));
+            meta_borrowed = metadata_ptr != nullptr;
+        } else {
+            metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+        }
+        metadata = metadata_ptr.get();
+        if (metadata == nullptr) {
+            throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+        }
+
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -616,7 +649,18 @@ llama_model_loader::llama_model_loader(
                     /*.no_alloc = */ true,
                     /*.ctx      = */ &ctx,
                 };
-                gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
+
+                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+
+                gguf_context_ptr ctx_gguf;
+                if (use_mmap) {
+                    // keep mappings index-aligned with files; parse the split metadata
+                    // from its mapping like the main file
+                    mappings.emplace_back(std::make_unique<llama_mmap>(files.back().get(), /*prefetch =*/ -1, llama_cpu_is_numa()));
+                    ctx_gguf.reset(gguf_init_from_buffer_borrow(mappings.back()->addr(), mappings.back()->size(), split_params));
+                } else {
+                    ctx_gguf.reset(gguf_init_from_file(fname_split, split_params));
+                }
                 if (!ctx_gguf) {
                     throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
                 }
@@ -633,7 +677,6 @@ llama_model_loader::llama_model_loader(
                     }
                 }
 
-                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -787,7 +830,8 @@ llama_model_loader::llama_model_loader(
                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
                 : gguf_type_name(type);
 
-            std::string value          = gguf_kv_to_str(metadata, i);
+            // the value is only previewed (40 chars) - do not stringify huge arrays
+            std::string value          = gguf_kv_to_str(metadata, i, /*max_arr_items =*/ 4);
             const size_t MAX_VALUE_LEN = 40;
             if (value.size() > MAX_VALUE_LEN) {
                 value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
@@ -816,6 +860,28 @@ llama_model_loader::llama_model_loader(
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+
+    // size of the metadata region of the main file - kept mapped for the model lifetime
+    if (!files.empty()) {
+        meta_keep = gguf_get_data_offset(metadata);
+    }
+
+    LLAMA_LOG_INFO("%s: timing: GGUF metadata parsed in %.2f ms (%d KV pairs, %d tensors)\n",
+            __func__, (ggml_time_us() - t_start_us)/1000.0, n_kv, n_tensors);
+}
+
+llama_model_loader::~llama_model_loader() {
+    // safety net for error paths: never destroy a still-registered mapping
+    unregister_mappings();
+}
+
+void llama_model_loader::unregister_mappings() {
+    if (host_unregister) {
+        for (void * addr : registered_mappings) {
+            host_unregister(addr);
+        }
+    }
+    registered_mappings.clear();
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1050,10 +1116,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
             int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                 // duplicated output tensor
-            max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+            max_n_tensors += 1;                   // duplicated output tensor
+            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             if (files.empty()) {
-                max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
+                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
@@ -1334,26 +1400,46 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
-            bool is_numa = false;
+        for (size_t idx = 0; idx < files.size(); idx++) {
+            if (idx >= mappings.size()) {
+                // not mapped during metadata parsing (e.g. FILE* based loads) - map now
+                const int64_t t_start_us = ggml_time_us();
+                mappings.emplace_back(std::make_unique<llama_mmap>(files[idx].get(), prefetch ? -1 : 0, llama_cpu_is_numa()));
+                LLAMA_LOG_INFO("%s: timing: mmap of %.2f MiB (readahead %s) took %.2f ms\n",
+                        __func__, mappings.back()->size()/1024.0/1024.0, prefetch ? "on" : "off",
+                        (ggml_time_us() - t_start_us)/1000.0);
+            }
 
-            auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (dev) {
-                auto * reg = ggml_backend_dev_backend_reg(dev);
-                auto * is_numa_fn = (decltype(ggml_is_numa) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
-                if (is_numa_fn) {
-                    is_numa = is_numa_fn();
+            const auto & mapping = mappings[idx];
+            const double sz_mib  = mapping->size()/1024.0/1024.0;
+
+            // pin the mapping for DMA uploads if a device backend provided a register fn
+            if (host_register) {
+                const int64_t t_reg_us = ggml_time_us();
+                if (host_register(mapping->addr(), mapping->size())) {
+                    registered_mappings.push_back(mapping->addr());
+                    LLAMA_LOG_INFO("%s: timing: host-registered (pinned) %.2f MiB mapping in %.2f ms\n",
+                            __func__, sz_mib, (ggml_time_us() - t_reg_us)/1000.0);
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to host-register %.2f MiB mapping - falling back to streamed tensor loading\n",
+                            __func__, sz_mib);
+                    unregister_mappings();
+                    host_register = nullptr;
+                    use_mmap      = false;
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
-            mappings.emplace_back(std::move(mapping));
+
+            if (!use_mmap) {
+                // host registration failed - remaining files will be streamed
+                break;
+            }
         }
     }
 
@@ -1518,6 +1604,17 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    if (use_mmap) {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: mmap (%s)\n", __func__,
+                !registered_mappings.empty() ? "host-registered: device uploads are DMA from the pinned mapping"
+                                             : "zero-copy for host buffers, synchronous pageable copies for device buffers");
+    } else if (upload_backend) {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: async uploads via %zu x %.1f MiB pinned staging buffers (direct I/O: %s)\n",
+                __func__, n_buffers, buffer_size/1024.0/1024.0, alignment != 1 ? "yes" : "no");
+    } else {
+        LLAMA_LOG_INFO("%s: timing: upload strategy: synchronous buffered reads + pageable copies\n", __func__);
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1666,12 +1763,16 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
-        // unmap offloaded tensors and metadata
+        // unmap offloaded tensors; keep the metadata region of the main file mapped
+        // for the lifetime of the model (metadata/vocab string views point into it)
         if (use_mmap) {
+            // unpin before unmapping anything
+            unregister_mappings();
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
-                mapping->unmap_fragment(0, mmap_used.first);
+                const size_t keep = idx == 0 ? std::min(meta_keep, mapping->size()) : 0;
+                mapping->unmap_fragment(keep, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }

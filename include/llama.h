@@ -317,7 +317,10 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
-        bool use_mmap;        // use mmap if possible
+        bool use_mmap;        // allow mmap of the model file. for weights bound to devices that cannot
+                              // use the mapping in place (e.g. CUDA), the mapping is pinned via the
+                              // device backend so uploads run as DMA; if the backend cannot pin host
+                              // memory, the file is streamed through pinned staging buffers instead
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
@@ -339,6 +342,7 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -1010,7 +1014,11 @@ extern "C" {
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
-    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+    //
+    // note: using this can cause extra graph reallocations because it changes the graph topology with MoE models,
+    //       so it is generally not recommended to use in practice. will be removed in the future
+    DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
+            "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

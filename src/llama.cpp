@@ -225,7 +225,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        igpus.push_back({false, dev});
+                        if (igpus.empty()) {
+                            igpus.push_back({false, dev});
+                        }
                         break;
                     case GGML_BACKEND_DEVICE_TYPE_META:
                         GGML_ABORT("fatal error");
@@ -303,6 +305,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
 
+        int64_t t_phase_us = ggml_time_us();
+
         try {
             model->load_hparams(ml);
         } catch(const std::exception & e) {
@@ -311,11 +315,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+
+        LLAMA_LOG_INFO("%s: timing: hparams loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
+        t_phase_us = ggml_time_us();
+
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
+
+        LLAMA_LOG_INFO("%s: timing: vocab loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
 
         model->load_stats(ml);
         model->print_info();
@@ -325,9 +335,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        t_phase_us = ggml_time_us();
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        LLAMA_LOG_INFO("%s: timing: tensors loaded in %.2f ms\n", __func__, (ggml_time_us() - t_phase_us)/1000.0);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
@@ -475,7 +489,9 @@ static bool llama_mtp_vocab_matches(const llama_model & tgt, const llama_model &
     constexpr int32_t k_check_from = 5; // align with speculative MTP vocab check
     for (uint32_t i = (uint32_t) k_check_from; i < vt.n_tokens(); ++i) {
         const llama_token id = (llama_token) i;
-        if (std::strcmp(vt.token_get_text(id), va.token_get_text(id)) != 0) {
+        // compare the text views directly - token_get_text() would materialize the
+        // NUL-terminated shadow table of both vocabs just for this check
+        if (vt.get_token_data(id).text != va.get_token_data(id).text) {
             LLAMA_LOG_ERROR("%s: vocab text mismatch at token id %d\n", __func__, (int) id);
             return false;
         }

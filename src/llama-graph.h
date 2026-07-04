@@ -37,7 +37,8 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_MTP,        // gemma4_assistant: separate-model cross-attn draft head (one step)
 };
 
-enum llm_ffn_op_type {
+enum llm_ffn_op_type : int {
+    LLM_FFN_NONE = 0,           // sentinel: unset; archs must assign before use
     LLM_FFN_SILU,
     LLM_FFN_GELU,
     LLM_FFN_RELU,
@@ -718,6 +719,7 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
     ggml_tensor * get_argmax()      const { return t_argmax; }
+    ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -748,6 +750,7 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_argmax      = nullptr; // optional, currently MTP-only (see get_argmax): I32 [1] on-device greedy token
+    ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm (upstream nextn)
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
