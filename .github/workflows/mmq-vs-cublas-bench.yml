@@ -124,21 +124,27 @@ jobs:
       - name: Benchmark
         run: |
           set -uxo pipefail
+          # This runner's A6000 is shared; capture free VRAM so a context-alloc
+          # failure is a diagnosable OOM, not a silent "failed to create context".
+          smi() { nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader; }
           common=(-ngl "$NGL" -p "$PROMPT_SIZES" -n "$GEN" -fa "$FA" -r 3 -o md)
           {
             echo "## MMQ vs cuBLAS - sm_86 (\`$CUDA_ARCH\`, CUDA 12.9)"
             echo '```'
             nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+            echo "VRAM total,used,free at start: $(smi)"
             echo '```'
-            echo "-p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`  (pp = prefill, the decision-relevant rows; the model column shows the quant)"
+            echo "-p \`$PROMPT_SIZES\` -n \`$GEN\` -fa \`$FA\`  (pp = prefill, decision-relevant; model col shows quant). VRAM(total,used,free) printed per model."
             # one binary built per arm; bench every downloaded model on both arms
             for m in benchmodels/*.gguf; do
               echo
-              echo "### Model: \`$(basename "$m")\`"
+              echo "### Model: \`$(basename "$m")\`  (VRAM free before: $(smi))"
               echo "#### Baseline (MMQ - what ships today)"
-              ./build-mmq/bin/llama-bench -m "$m" "${common[@]}"
+              ./build-mmq/bin/llama-bench -m "$m" "${common[@]}" \
+                || { echo "::error::llama-bench (MMQ) failed on $(basename "$m") -- VRAM: $(smi)"; exit 1; }
               echo
               echo "#### GGML_CUDA_FORCE_CUBLAS=ON (mmq instances unused at runtime)"
-              ./build-cublas/bin/llama-bench -m "$m" "${common[@]}"
+              ./build-cublas/bin/llama-bench -m "$m" "${common[@]}" \
+                || { echo "::error::llama-bench (cuBLAS) failed on $(basename "$m") -- VRAM: $(smi)"; exit 1; }
             done
           } | tee -a "$GITHUB_STEP_SUMMARY"
