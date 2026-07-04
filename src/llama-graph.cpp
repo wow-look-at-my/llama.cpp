@@ -579,19 +579,29 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
-    // base tensors may not be allocated if there are no non-SWA attention layers
+    // Guard each input independently on its OWN buffer. The k/v idxs are only
+    // allocated when the graph WRITES K/V to the cache; the MTP cross-attention
+    // draft graph reads the target's cached K/V (never writes), so its k/v idxs
+    // get no buffer — but its kq_mask IS allocated and used. Bundling the mask
+    // fill behind self_k_idxs->buffer left the MTP mask uninitialized (garbage),
+    // so the draft attended to every (mostly empty) KV cell.
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
         mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
-
+    }
+    if (self_kq_mask && self_kq_mask->buffer) {
         mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 
-    // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
+    }
+    if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
         mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
-
+    }
+    if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
         mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
 
