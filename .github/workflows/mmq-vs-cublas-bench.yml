@@ -88,8 +88,9 @@ jobs:
         id: modelkey
         run: echo "hash=$(echo -n "$MODEL_URLS" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache model(s)
-        uses: actions/cache@v4
+      - name: Restore model cache
+        id: modelcache
+        uses: actions/cache/restore@v4
         with:
           path: benchmodels
           key: bench-models-${{ steps.modelkey.outputs.hash }}
@@ -104,14 +105,26 @@ jobs:
           for u in $MODEL_URLS; do
             i=$((i+1))
             out="benchmodels/bench-$i.gguf"
-            # a cache hit restores the file already; curl only on a miss (the
-            # cache is only saved on job success, so a partial file is never kept)
+            # a cache hit restores the file already; curl only on a miss (curl -f
+            # exits non-zero on failure, so a partial file never reaches the
+            # save step below)
             if [ ! -s "$out" ]; then
               curl -fL --retry 4 --retry-delay 3 -o "$out" "$u"
             fi
             test -s "$out" || { echo "::error::model download failed: $u"; exit 1; }
             ls -lh "$out"
           done
+
+      # save the cache NOW, as an ordinary step right after the downloads --
+      # a plain actions/cache@v4 saves in its post-job hook, which is skipped
+      # when the job fails, so a failed multi-hour build/bench would throw away
+      # ~92 GB of downloaded models
+      - name: Save model cache
+        if: steps.modelcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: benchmodels
+          key: bench-models-${{ steps.modelkey.outputs.hash }}
 
       - name: Build llama-bench x2 (MMQ baseline + GGML_CUDA_FORCE_CUBLAS)
         run: |
