@@ -79,49 +79,41 @@ jobs:
           "$CUDA_HOME/bin/nvcc" --version | tail -2
           nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-      # hashFiles() only hashes files, so derive the cache key from the URL list
-      # in a step; any change to the list (order included) is a new key
-      - name: Compute model cache key
-        id: modelkey
-        run: echo "hash=$(echo -n "$MODEL_URLS" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore model cache
-        id: modelcache
-        uses: actions/cache/restore@v4
-        with:
-          path: benchmodels
-          key: bench-models-${{ steps.modelkey.outputs.hash }}
-
+      # NOT actions/cache: on this persistent self-hosted runner, cache/save
+      # tar+zstd's a second ~85 GB compressed copy of the ~92 GB of models onto
+      # the SAME quota-limited workspace volume ("zstd: error 25: Disk quota
+      # exceeded", run 28690799721). Cache = a persistent directory instead:
+      # RUNNER_TOOL_CACHE survives across jobs on self-hosted runners, files are
+      # keyed by URL basename so different URL sets coexist, and already-present
+      # files are simply not re-downloaded.
       - name: Fetch model(s)
         run: |
           set -euxo pipefail
-          # dedicated dir -- the repo's own models/ ships ggml-vocab-*.gguf test
-          # files that would otherwise be caught by the bench glob and fail to load
+          df -h "$RUNNER_TOOL_CACHE" .
+          MODELS_DIR="${RUNNER_TOOL_CACHE}/benchmodels"
+          mkdir -p "$MODELS_DIR"
+          # clear stray workspace leftovers from the old actions/cache flow,
+          # then recreate the dedicated dir -- the repo's own models/ ships
+          # ggml-vocab-*.gguf test files that would otherwise be caught by the
+          # bench glob and fail to load
+          rm -rf benchmodels cache.tzst
           mkdir -p benchmodels
           i=0
           for u in $MODEL_URLS; do
             i=$((i+1))
-            out="benchmodels/bench-$i.gguf"
-            # a cache hit restores the file already; curl only on a miss (curl -f
-            # exits non-zero on failure, so a partial file never reaches the
-            # save step below)
+            out="$MODELS_DIR/$(basename "$u")"
+            # curl only if missing (curl -f exits non-zero on failure, so a
+            # partial file never survives as a "cached" model)
             if [ ! -s "$out" ]; then
               curl -fL --retry 4 --retry-delay 3 -o "$out" "$u"
             fi
             test -s "$out" || { echo "::error::model download failed: $u"; exit 1; }
             ls -lh "$out"
+            # symlink (no disk cost) the selected models into the workspace in
+            # order, so the bench step's existing bench-*.gguf glob is unchanged
+            ln -sfn "$out" "benchmodels/bench-$i.gguf"
           done
-
-      # save the cache NOW, as an ordinary step right after the downloads --
-      # a plain actions/cache@v4 saves in its post-job hook, which is skipped
-      # when the job fails, so a failed multi-hour build/bench would throw away
-      # ~92 GB of downloaded models
-      - name: Save model cache
-        if: steps.modelcache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: benchmodels
-          key: bench-models-${{ steps.modelkey.outputs.hash }}
+          du -sh "$MODELS_DIR"
 
       - name: Build llama-bench x2 (MMQ baseline + GGML_CUDA_FORCE_CUBLAS)
         run: |
