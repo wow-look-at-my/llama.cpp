@@ -1,5 +1,29 @@
 # TODO
 
+## Centroid LM head for the Gemma 4 MTP drafter (dropped in the uprev)
+
+The old fork dialect implemented the drafter's "efficient embedder" centroid
+LM head (`mtp.centroids` + `mtp.token_ordering`, gated by
+`use_ordered_embeddings`): route the hidden state through centroids, then
+score only the top-k token cluster instead of the full vocab matmul.
+**Upstream's `gemma4-assistant` has no centroid head** — its logits are a
+full `mul_mat` with the tied `token_embd`, and its own converter filters the
+HF `masked_embedding.*` tensors out entirely.
+
+Upstream's loader does accept-and-ignore the tensors by name
+(`masked_embd_centroids.weight` / `masked_embd_ordering` — note: no
+`.weight` suffix on the latter) through the unused-tensor path
+(`GGML_OP_NONE` → "model has unused tensor ... ignoring"), so a GGUF
+carrying them loads fine today. Re-adding the head therefore needs:
+
+1. converter emission in `wow-look-at-my/ollama` (`convert/convert_gemma4.go`)
+   under those exact upstream names,
+2. the head implementation in `src/models/gemma4-assistant.cpp` (centroid
+   routing + top-k scoring in the drafter graph),
+3. a GPU A/B on the 31B checkpoint (draft quality + tok/s with and without
+   the head) to prove it is worth carrying — not measurable in a CPU-only
+   dev environment.
+
 ## GGUF format: strings are length-prefixed but the C API hands out `const char *`
 
 **The mismatch.** GGUF stores every string (metadata values, and critically the
