@@ -1472,7 +1472,10 @@ void gguf_set_kv(struct gguf_context * ctx, const struct gguf_context * src) {
             case GGUF_TYPE_STRING: {
                 std::vector<const char *> tmp(ne);
                 for (size_t j = 0; j < ne; ++j) {
-                    tmp[j] = kv.data_string[j].c_str();
+                    // get_val<std::string> materializes an owned NUL-terminated copy
+                    // for borrowed (zero-copy parsed) contexts; indexing data_string
+                    // directly would read an empty vector there
+                    tmp[j] = kv.get_val<std::string>(j).c_str();
                 }
                 gguf_set_arr_str(ctx, kv.get_key().c_str(), tmp.data(), ne);
             } break;
